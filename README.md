@@ -13,6 +13,8 @@ Quantitative finance engine that transforms blackbox buy/sell signals into audit
 - **Manual System Reset Gate Available** — Running `python main.py --clear` wipes the time cooldown gate and clears active PIPELINE.md log entries while preserving the header and archive pointer, enabling a clean epoch restart.
 - **Portfolio Allocation Dashboard Live** — Evaluates a 10-ticker multi-sector universe with $100,000 virtual capital. Banks bypass solvency checks via a sector exception guard. Live market prices determine integer-only share targets. Outputs a ranked 6-column terminal table: Ticker, Solvency Status, Net Sentiment Score, Allocation %, Dollar Capital, and Target Shares.
 - **Semantic Analysis Engine Active** — Every solvency or sentiment rejection now includes a human-readable [Semantic Analysis] justification explaining the first-principles financial reasoning behind the mathematical gate decision.
+- **NYSE Market Clock Gate Active** — Detects US Eastern Time and only displays the full trade execution dashboard during regular market hours (9:30 AM–4:00 PM ET, Mon–Fri). Off-hours runs still compute all analytics but output a summary report instead of executable allocation orders.
+- **Automated Team Desk Notifications Online** — Every valid MARKET_OPEN run transmits a formatted portfolio report to a Discord/Slack webhook loaded securely from the `.env` file. Off-hours runs suppress the alert.
 
 ## Features Implemented
 

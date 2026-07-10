@@ -19,6 +19,16 @@
 - **Reason:** Glassbox transparency mandate — each gate rejection now surfaces a human-readable, first-principles justification for the mathematical decision
 - **Files:** `main.py`
 
+### 2026-07-10 15:20 (UTC)
+- **Change:** Added `check_market_clock()` — detects US Eastern Time weekday market hours (9:30 AM–4:00 PM); MARKET_OPEN shows full trade execution table, ANALYTICAL_OFF_HOURS prints summary with processed/passed counts and top performer
+- **Reason:** Prevent off-hours trade signal output; analytics still run for research while blocking premature execution routing
+- **Files:** `main.py`
+
+### 2026-07-10 15:22 (UTC)
+- **Change:** Added `post_to_team_desk()` — parses leaderboard into formatted text and sends HTTP POST to Discord/Slack webhook loaded from `WEBHOOK_URL` env var; fires only during MARKET_OPEN
+- **Reason:** Automated team notification for every valid trading run; webhook URL kept out of source code via .env
+- **Files:** `main.py`, `.env`
+
 ---
 
 _[System Note: Archive active at `history/LOG_ARCHIVE_V1.md` | Current Archive Entries: 0]_

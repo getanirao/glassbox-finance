@@ -1,8 +1,11 @@
 import sys
 import os
 import math
+import json
 import datetime
 import re
+import zoneinfo
+import requests
 import yfinance as yf
 import pandas as pd
 
@@ -33,6 +36,58 @@ NEGATIVE_LEXICON = {
     "warning", "cut", "lower", "fail", "negative", "volatility",
     "short", "underperform", "underperformed", "layoff", "fraud",
 }
+
+
+def post_to_team_desk(results, market_state, et_now, total_tickers):
+    webhook_url = os.environ.get("WEBHOOK_URL", "")
+    if not webhook_url:
+        return
+
+    ranked = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
+    total_score = sum(r["adjusted_score"] for r in ranked)
+
+    lines = []
+    lines.append("**Glassbox Finance - Portfolio Report**")
+    lines.append(f"Status: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
+    lines.append(f"Capital: ${STARTING_CAPITAL:,}  |  Universe: {total_tickers} tickers")
+    lines.append("")
+    lines.append("```")
+    header = f"{'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'Dollar Amt':>12} {'Shares':>8}"
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for r in ranked:
+        ticker = r["ticker"]
+        status = r["status"]
+        sent = r["sentiment"]
+        score = r["adjusted_score"]
+        pct = score / total_score * 100 if total_score > 0 else 0
+        dollar_alloc = STARTING_CAPITAL * (pct / 100)
+
+        try:
+            stock = yf.Ticker(ticker)
+            price = stock.fast_info.last_price
+            if price is None or price <= 0:
+                hist = stock.history(period="1d")
+                price = hist["Close"].iloc[-1] if not hist.empty else 0
+        except Exception:
+            price = 0
+
+        target_shares = int(dollar_alloc / price) if price and price > 0 else 0
+        sent_label = f"{sent:+.3f}"
+        lines.append(f"{ticker:<8} {status:<22} {sent_label:>10} {pct:>9.2f}% ${dollar_alloc:>9,.2f} {target_shares:>7}")
+
+    lines.append("-" * len(header))
+    lines.append(f"{'TOTAL':<8} {'':<22} {'':>10} {'100.00%':>10} ${STARTING_CAPITAL:>9,.2f} {'':>7}")
+    lines.append("```")
+    payload = "\n".join(lines)
+
+    try:
+        resp = requests.post(webhook_url, json={"content": payload}, timeout=15)
+        resp.raise_for_status()
+        print(f"\n  [Team Desk] Portfolio report transmitted to team webhook (HTTP {resp.status_code}).")
+    except Exception as e:
+        print(f"\n  [Team Desk] Transmission failed - {e}.")
 
 
 def check_time_gate():
@@ -255,6 +310,26 @@ def display_portfolio_table(results):
     print(f"{'='*90}")
 
 
+def check_market_clock():
+    eastern = zoneinfo.ZoneInfo("US/Eastern")
+    now = datetime.datetime.now(eastern)
+
+    weekday = now.weekday()
+    hour = now.hour
+    minute = now.minute
+    current_time_minutes = hour * 60 + minute
+    open_minutes = 9 * 60 + 30
+    close_minutes = 16 * 60
+
+    is_weekday = weekday < 5
+    is_market_hours = open_minutes <= current_time_minutes < close_minutes
+
+    if is_weekday and is_market_hours:
+        return "MARKET_OPEN", now
+
+    return "ANALYTICAL_OFF_HOURS", now
+
+
 def handle_reset():
     if "--clear" not in sys.argv:
         return
@@ -311,6 +386,11 @@ def main():
     print(f"  Starting Capital: ${STARTING_CAPITAL:,}  |  Universe: {len(TICKERS)} tickers")
     print(f"{'='*80}")
 
+    market_state, et_now = check_market_clock()
+
+    print(f"  Market Clock:   {et_now.strftime('%Y-%m-%d %H:%M %Z')}  |  Status: {market_state}")
+    print(f"{'='*80}")
+
     results = []
     total = len(TICKERS)
 
@@ -322,7 +402,28 @@ def main():
         except Exception as e:
             print(f"  [{i}/{total}] {ticker} ERROR - {e}")
 
-    display_portfolio_table(results)
+    if market_state == "MARKET_OPEN":
+        display_portfolio_table(results)
+        post_to_team_desk(results, market_state, et_now, total)
+    else:
+        print(f"\n{'='*80}")
+        print(f"  MARKET CLOCK GATE")
+        print(f"{'='*80}")
+        print(f"  [Market Clock Gate]: Active portfolio execution routing is locked until")
+        print(f"  the next regular NYSE market open. Printing Off-Hours Analytics")
+        print(f"  Framework instead...")
+        print(f"  Current Time (ET): {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
+
+        passed = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
+        total_passing = len(passed)
+        avg_score = sum(r["adjusted_score"] for r in passed) / total_passing if total_passing > 0 else 0
+
+        print(f"  Tickers Processed: {total}")
+        print(f"  Tickers Passed:    {total_passing}")
+        if total_passing > 0:
+            print(f"  Average Score:     {avg_score:.1f}/100")
+            print(f"  Top Performer:     {passed[0]['ticker']} ({passed[0]['adjusted_score']:.1f}/100)")
+        print(f"{'='*80}")
 
     print(f"\n{'='*80}")
     print("  Done.")

@@ -4,6 +4,11 @@
 # Runtime state files
 .last_run
 sandbox_history.json
+sandbox_performance.png
+.observation_state
+.message_state
+.news_message_state
+.news_cache.json
 
 # Python
 __pycache__/

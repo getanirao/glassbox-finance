@@ -1,6 +1,6 @@
 # Pipeline Log — Wolves of Wall Street
 
-> Active Phase: Phase 2 — Solvency Screening
+> Active Phase: Phase 3 — Portfolio-Wide Evaluation
 
 ---
 
@@ -47,6 +47,11 @@
 ### 2026-07-10 06:25 (UTC)
 - **Change:** Added `sentiment_gate()` — deterministic lexicon-based sentiment analysis on yfinance news headlines; computes Net Sentiment Score [-1.0, +1.0] and applies 0.70–1.00x penalty multiplier on solvency health score if sentiment is bearish
 - **Reason:** Phase 2 — second quantitative gate that discounts valuation on negative news sentiment before final output
+- **Files:** `main.py`
+
+### 2026-07-10 06:45 (UTC)
+- **Change:** Replaced single-ticker input with static 10-ticker universe (AAPL, MSFT, GOOGL, JPM, GS, JNJ, PFE, AMZN, WMT, XOM); added `process_ticker()` loop, `display_portfolio_table()` ranking, and proportional weight allocation
+- **Reason:** Phase 3 — portfolio-wide evaluation framework that screens an entire multi-sector universe and outputs a ranked allocation table
 - **Files:** `main.py`
 
 ---

@@ -12,6 +12,8 @@ pd.set_option("display.max_rows", 200)
 GATE_FILE = ".last_run"
 GATE_HOURS = 24
 
+TICKERS = ["AAPL", "MSFT", "GOOGL", "JPM", "GS", "JNJ", "PFE", "AMZN", "WMT", "XOM"]
+
 POSITIVE_LEXICON = {
     "revenue", "growth", "beats", "beat", "profit", "upgrade", "upgraded",
     "bullish", "dividend", "earnings", "rally", "outperform", "outperformed",
@@ -74,86 +76,40 @@ def check_time_gate():
 
 def validate_statement(df, name):
     if df is None or df.empty:
-        print(f"  WARNING: {name} returned empty — ticker may be invalid or delisted.")
         return False
     if df.isna().all().all():
-        print(f"  WARNING: {name} contains all NaN values — no financial data available.")
         return False
     return True
 
 
 def evaluate_solvency(bs):
-    print(f"\n{'='*80}")
-    print(f"  SOLVENCY ASSESSMENT")
-    print(f"{'='*80}")
-
     try:
         current_assets = bs.loc[bs.index.str.contains("Current Assets", case=False)].iloc[0, 0]
         current_liabilities = bs.loc[bs.index.str.contains("Current Liabilities", case=False)].iloc[0, 0]
         total_liabilities = bs.loc[bs.index.str.contains("Total Liabilities", case=False)].iloc[0, 0]
         equity = bs.loc[bs.index.str.contains("Stockholders Equity|Stockholder Equity", case=False)].iloc[0, 0]
-    except (IndexError, KeyError, AttributeError) as e:
-        print(f"  ERROR: Could not locate required balance-sheet line items ({e}).")
-        return None, None
+    except (IndexError, KeyError, AttributeError):
+        return None, None, None, None
 
     current_ratio = current_assets / current_liabilities
     d_to_e = total_liabilities / equity
-
-    print(f"  Current Assets (most recent):      ${current_assets:>14,.2f}")
-    print(f"  Current Liabilities (most recent):  ${current_liabilities:>14,.2f}")
-    print(f"  -------------------------------------------------")
-    print(f"  Current Ratio:                      {current_ratio:>14.2f}    (threshold: >= 1.2)")
-    print()
-    print(f"  Total Liabilities (most recent):    ${total_liabilities:>14,.2f}")
-    print(f"  Stockholders Equity (most recent):   ${equity:>14,.2f}")
-    print(f"  -------------------------------------------------")
-    print(f"  Debt-to-Equity Ratio:               {d_to_e:>14.2f}    (threshold: <= 1.5)")
-
-    failures = []
-    if current_ratio < 1.2:
-        failures.append(
-            f"  [FAIL] Current Ratio {current_ratio:.2f} < 1.2\n"
-            f"         ({current_assets:,.0f} / {current_liabilities:,.0f} = {current_ratio:.2f})"
-        )
-
-    if d_to_e > 1.5:
-        failures.append(
-            f"  [FAIL] Debt-to-Equity {d_to_e:.2f} > 1.5\n"
-            f"         ({total_liabilities:,.0f} / {equity:,.0f} = {d_to_e:.2f})"
-        )
-
     cr_score = min(1.0, current_ratio / 1.2)
     de_score = min(1.0, 1.5 / d_to_e)
     health_score = ((cr_score + de_score) / 2) * 100
 
-    if failures:
-        print()
-        for f in failures:
-            print(f)
-        print(f"  SOLVENCY: FAIL - Asset rejected (Health Score: {health_score:.1f}/100).")
-        print(f"{'='*80}")
-        return None, health_score
-    else:
-        print(f"  [PASS] Current Ratio {current_ratio:.2f} >= 1.2")
-        print(f"  [PASS] Debt-to-Equity {d_to_e:.2f} <= 1.5")
-        print(f"\n  SOLVENCY: PASS - Asset cleared (Health Score: {health_score:.1f}/100).")
-        print(f"{'='*80}")
-        return True, health_score
+    if current_ratio < 1.2 or d_to_e > 1.5:
+        return False, health_score, current_ratio, d_to_e
+
+    return True, health_score, current_ratio, d_to_e
 
 
-def sentiment_gate(stock, ticker):
-    print(f"\n{'='*80}")
-    print(f"  SENTIMENT GATE — {ticker}")
-    print(f"{'='*80}")
-
+def sentiment_gate(stock):
     try:
         news = stock.news
-    except Exception as e:
-        print(f"  WARNING: Could not fetch news ({e}). Skipping sentiment gate.")
+    except Exception:
         return 0.0, 1.0
 
     if not news:
-        print(f"  No recent news found. Skipping sentiment gate.")
         return 0.0, 1.0
 
     headlines = []
@@ -182,83 +138,100 @@ def sentiment_gate(stock, ticker):
         penalty = 1.0 + (net_score * 0.3)
         penalty = max(0.70, penalty)
 
-    print(f"\n  Headlines scanned: {len(headlines)}")
-    print(f"  Positive tokens:   {pos_count}")
-    print(f"  Negative tokens:   {neg_count}")
-    print(f"  Net Sentiment:     {net_score:+.3f}    (range: -1.0 to +1.0)")
-
-    if net_score > 0.3:
-        print(f"  SENTIMENT: BULLISH")
-    elif net_score >= 0.0:
-        print(f"  SENTIMENT: NEUTRAL")
-    else:
-        print(f"  SENTIMENT: BEARISH")
-        print(f"\n  Sentiment penalty active: {penalty:.2f}x multiplier applied to valuation.")
-
-    if headlines:
-        print(f"\n  Recent headlines:")
-        for h in headlines[:5]:
-            print(f"    - {h}")
-
-    print(f"{'='*80}")
     return net_score, penalty
 
 
-check_time_gate()
+def process_ticker(ticker, index, total):
+    print(f"\n  [{index}/{total}] Processing {ticker} ...")
 
-try:
-    ticker = input("Enter stock ticker: ").strip().upper()
     stock = yf.Ticker(ticker)
 
-    print(f"\n{'='*80}")
-    print(f"  INCOME STATEMENT — {ticker}")
-    print(f"{'='*80}")
     inc = stock.income_stmt
     if not validate_statement(inc, "Income Statement"):
-        sys.exit(1)
-    print(inc.to_string())
+        print(f"  [{index}/{total}] {ticker} SKIPPED - No income statement data.")
+        return None
 
-    print(f"\n{'='*80}")
-    print(f"  BALANCE SHEET — {ticker}")
-    print(f"{'='*80}")
     bs = stock.balance_sheet
     if not validate_statement(bs, "Balance Sheet"):
-        sys.exit(1)
-    print(bs.to_string())
+        print(f"  [{index}/{total}] {ticker} SKIPPED - No balance sheet data.")
+        return None
+
+    solvency_ok, health_score, cr, dte = evaluate_solvency(bs)
+    if solvency_ok is None:
+        print(f"  [{index}/{total}] {ticker} SKIPPED - Solvency line items not found.")
+        return None
+
+    if not solvency_ok:
+        print(f"  [{index}/{total}] {ticker} FAILED solvency (CR={cr:.2f}, D/E={dte:.2f}).")
+        return None
+
+    net_sentiment, penalty = sentiment_gate(stock)
+    adjusted_score = health_score * penalty
+
+    print(f"  [{index}/{total}] {ticker} PASSED (Score: {adjusted_score:.1f}/100)")
+
+    return {
+        "ticker": ticker,
+        "health_score": health_score,
+        "current_ratio": cr,
+        "debt_to_equity": dte,
+        "sentiment": net_sentiment,
+        "penalty": penalty,
+        "adjusted_score": adjusted_score,
+    }
+
+
+def display_portfolio_table(results):
+    if not results:
+        print(f"\n{'='*80}")
+        print(f"  PORTFOLIO RESULT")
+        print(f"{'='*80}")
+        print(f"  No tickers passed all gates. Portfolio is empty.")
+        print(f"{'='*80}")
+        return
+
+    total_score = sum(r["adjusted_score"] for r in results)
 
     print(f"\n{'='*80}")
-    print(f"  CASH FLOW STATEMENT — {ticker}")
+    print(f"  PORTFOLIO RANKING TABLE")
     print(f"{'='*80}")
-    cf = stock.cashflow
-    if not validate_statement(cf, "Cash Flow Statement"):
-        sys.exit(1)
-    print(cf.to_string())
+    print(f"  {'Ticker':<8} {'Health':>8} {'CR':>8} {'D/E':>8} {'Sent':>8} {'Penalty':>8} {'Final':>8} {'Weight':>8}")
+    print(f"  {'------':<8} {'------':>8} {'---':>8} {'----':>8} {'----':>8} {'-------':>8} {'-----':>8} {'------':>8}")
 
-    solvency_ok, health_score = evaluate_solvency(bs)
+    for r in sorted(results, key=lambda x: x["adjusted_score"], reverse=True):
+        weight = (r["adjusted_score"] / total_score * 100) if total_score > 0 else 0
+        print(f"  {r['ticker']:<8} {r['health_score']:>7.1f} {r['current_ratio']:>7.2f} {r['debt_to_equity']:>7.2f} {r['sentiment']:>+7.3f} {r['penalty']:>7.2f}x {r['adjusted_score']:>7.1f} {weight:>6.1f}%")
 
-    if solvency_ok and health_score is not None:
-        net_sentiment, penalty = sentiment_gate(stock, ticker)
+    print(f"  {'------':<8} {'------':>8} {'---':>8} {'----':>8} {'----':>8} {'-------':>8} {'-----':>8} {'------':>8}")
+    print(f"  {'TOTAL':<8} {'':>8} {'':>8} {'':>8} {'':>8} {'':>8} {total_score:>7.1f} {'100.0%':>8}")
+    print(f"{'='*80}")
 
-        print(f"\n{'='*80}")
-        print(f"  FINAL VALUATION — {ticker}")
-        print(f"{'='*80}")
-        print(f"  Solvency Health Score:  {health_score:.1f}/100")
-        print(f"  Sentiment Score:        {net_sentiment:+.3f}")
 
-        if net_sentiment < 0.0:
-            adjusted = health_score * penalty
-            print(f"  Sentiment Multiplier:   {penalty:.2f}x")
-            print(f"  Adjusted Health Score:  {adjusted:.1f}/100")
-        else:
-            print(f"  Sentiment Multiplier:   1.00x (no penalty)")
-            print(f"  Final Health Score:     {health_score:.1f}/100")
+def main():
+    check_time_gate()
 
-        print(f"{'='*80}")
+    print(f"\n{'='*80}")
+    print(f"  PHASE 3 — PORTFOLIO-WIDE EVALUATION")
+    print(f"  Universe: {len(TICKERS)} tickers across Technology, Finance, Healthcare, Consumer, Energy")
+    print(f"{'='*80}")
+
+    results = []
+    total = len(TICKERS)
+
+    for i, ticker in enumerate(TICKERS, start=1):
+        try:
+            result = process_ticker(ticker, i, total)
+            if result is not None:
+                results.append(result)
+        except Exception as e:
+            print(f"  [{i}/{total}] {ticker} ERROR - {e}")
+
+    display_portfolio_table(results)
 
     print(f"\n{'='*80}")
     print("  Done.")
     print(f"{'='*80}")
 
-except Exception as e:
-    print(f"  ERROR: Unexpected failure — {e}")
-    sys.exit(1)
+
+if __name__ == "__main__":
+    main()

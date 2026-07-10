@@ -3,6 +3,7 @@
 
 # Runtime state files
 .last_run
+sandbox_history.json
 
 # Python
 __pycache__/

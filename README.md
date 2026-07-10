@@ -15,7 +15,7 @@ Quantitative finance engine that transforms blackbox buy/sell signals into audit
 - **Semantic Analysis Engine Active** — Every solvency or sentiment rejection now includes a human-readable [Semantic Analysis] justification explaining the first-principles financial reasoning behind the mathematical gate decision.
 - **NYSE Market Clock Gate Active** — Detects US Eastern Time and only displays the full trade execution dashboard during regular market hours (9:30 AM–4:00 PM ET, Mon–Fri). Off-hours runs still compute all analytics but output a summary report instead of executable allocation orders.
 - **Automated Team Desk Notifications Online** — Every valid MARKET_OPEN run transmits a formatted portfolio report to a Discord/Slack webhook loaded securely from the `.env` file. Off-hours runs suppress the alert.
-- **Dual-Mode Operating System Active** — Toggle `RUN_MODE` between "COMPETITION" (manual routing table + webhook alerts) and "SANDBOX" (auto-execution with persistent portfolio ledger, automated purchases at live prices, and ASCII capital growth chart). Both modes enforce the 24-hour cooldown and NYSE market clock.
+- **Dual-Mode Operating System Active** — Select mode at launch with `python main.py --comp` (manual routing table + webhook alerts) or `python main.py --sandbox` (auto-execution with persistent portfolio ledger, real-time matplotlib charting, and twin-clock architecture). Both modes enforce the 24-hour cooldown and NYSE market clock. Running with no arguments defaults to COMPETITION.
 - **Continuous News Streaming Framework Online** — Engine runs an infinite 60-minute loop across the full 10-ticker universe. Every cycle fetches live data, evaluates solvency, scans news sentiment, and transmits per-ticker Discord news alerts. The 24-hour allocation gate is detached from news — capital distribution fires only when NYSE is open AND 24h cooldown has expired.
 - **Deduplicated Rolling News Cache Active** — A persistent `.news_cache.json` stores every unique headline with per-article sentiment scores. Duplicate headlines across 60-minute cycles are silently skipped. The sentiment multiplier now uses a 24-hour rolling moving average of all unique headlines per ticker, replacing the previous point-in-time scoring for more stable and representative penalty calculations.
 - **Twin-Clock Architecture Active** — Two independent clocks govern the engine. The **24-Hour Decision Clock** restricts core portfolio re-allocations (solvency checks, sentiment re-parsing, holdings changes) to once per day in both COMPETITION and SANDBOX modes. The **1-Minute Visualization Clock** in SANDBOX mode runs continuous 60-second cycles that pull only current spot prices, calculate live net worth, update the portfolio history ledger, and re-plot the matplotlib performance chart — without ever changing holdings.
@@ -29,10 +29,16 @@ A complete operational directory detailing all valid terminal arguments, system 
 
 ### Terminal Execution Commands
 
-#### Standard Asset Evaluation Route
-Executes the main quantitative pipeline based on your active global configurations.
+#### Competition Advisory Desk (Default)
+Executes with strict 24-hour time locks and NYSE hour boundaries. Outputs text-only integer share ledgers for manual tournament order entries.
 ```bash
-python main.py
+python main.py --comp
+```
+
+#### Sandbox Paper Trading
+Accelerates to a high-speed 1-minute visualization cadence during market open hours. Automates virtual data collection, generates matplotlib real-time performance charts, and streams live graphical dashboard updates.
+```bash
+python main.py --sandbox
 ```
 
 #### System Reset & Infrastructure Purge
@@ -41,16 +47,34 @@ Deletes local time tracking parameters (`.last_run`), wipes active news caches (
 python main.py --clear
 ```
 
+#### Default (No Arguments)
+If no flag is provided, the engine defaults to COMPETITION mode and prints a notice listing the available command choices.
+```bash
+python main.py
+```
+
 ---
 
-### Global Configuration Parameter Flags
+### Command-Line Arguments
+*Parsed at launch via `argparse` in `parse_args_and_mode()`.*
+
+| Argument | Mode | Operational Outcome |
+| :--- | :--- | :--- |
+| **`--comp`** | COMPETITION | Enforces strict 24-hour time locks and NYSE hour boundaries. Outputs text-only integer share ledgers designed for manual tournament order entries. |
+| **`--sandbox`** | SANDBOX | Accelerates the execution loop to a high-speed 1-minute cadence during market open hours. Automates virtual data collection, generates `matplotlib` visual trend charts, and streams live graphical updates. |
+| **`--clear`** | — | Purges all local state (`.last_run`, `.news_cache.json`, `.observation_state`, `.message_state`), deletes the active Discord dashboard message, and resets PIPELINE.md log entries. |
+| *(none)* | COMPETITION | Default mode. Prints a usage notice then runs as COMPETITION. |
+
+### Global Configuration Constants
 *Located at the top of `main.py` for framework calibration.*
 
-| Configuration Flag | Valid Settings | Operational Outcome |
+| Constant | Default | Purpose |
 | :--- | :--- | :--- |
-| **`RUN_MODE`** | `"COMPETITION"` | Enforces strict 24-hour time locks and NYSE hour boundaries. Outputs text-only integer share ledgers designed for manual tournament order entries. |
-| | `"SANDBOX"` | Accelerates the execution loop to a high-speed 1-minute cadence during market open hours. Automates virtual data collection, generates `matplotlib` visual trend charts, and streams live graphical updates. |
 | **`STARTING_CAPITAL`** | `100000` | Anchors the allocation engine's cash base to match the official bounds of the target competition simulator. |
+| **`GATE_HOURS`** | `24` | Cooldown period between daily allocation cycles. |
+| **`VOLATILITY_THRESHOLD`** | `0.005` | Maximum 5-minute rolling volatility spread (0.5%) for smart trigger execution. |
+| **`VOLATILITY_WINDOW`** | `5` | Number of 1-minute price samples used for rolling volatility computation. |
+| **`GRACE_MINUTES`** | `30` | Market-open grace period before forced execution regardless of volatility. |
 
 ### Automated Time-Series Status Flags
 *Dynamically calculated by the engine's internal clock layers.*

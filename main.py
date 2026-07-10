@@ -10,6 +10,7 @@ import requests
 import yfinance as yf
 import pandas as pd
 from dotenv import load_dotenv
+import argparse
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -21,7 +22,7 @@ pd.set_option("display.max_columns", 10)
 pd.set_option("display.width", 120)
 pd.set_option("display.max_rows", 200)
 
-RUN_MODE = "SANDBOX"
+
 STARTING_CAPITAL = 100000
 GATE_FILE = ".last_run"
 GATE_HOURS = 24
@@ -712,9 +713,6 @@ def sandbox_execute(ranked, total_score):
 
 
 def handle_reset():
-    if "--clear" not in sys.argv:
-        return
-
     PIPELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PIPELINE.md")
 
     if os.path.exists(GATE_FILE):
@@ -788,8 +786,46 @@ def handle_reset():
     sys.exit(0)
 
 
+def parse_args_and_mode():
+    parser = argparse.ArgumentParser(
+        description="Glassbox Finance — Wolves of Wall Street",
+        add_help=True
+    )
+    parser.add_argument("--sandbox", action="store_true",
+                        help="Run in SANDBOX mode (twin-clock paper trading with 1-min visualization)")
+    parser.add_argument("--comp", action="store_true",
+                        help="Run in COMPETITION mode (strict 24h advisory routing desk)")
+    parser.add_argument("--clear", action="store_true",
+                        help="System reset and infrastructure purge")
+
+    args = parser.parse_args()
+
+    if args.clear:
+        handle_reset()
+
+    if args.sandbox and args.comp:
+        print("  Error: --sandbox and --comp are mutually exclusive.")
+        sys.exit(1)
+
+    if args.sandbox:
+        return "SANDBOX"
+
+    if args.comp:
+        return "COMPETITION"
+
+    print("\n  Glassbox Finance — Wolves of Wall Street")
+    print("  " + "-" * 50)
+    print("  Usage: python main.py [--sandbox | --comp | --clear]")
+    print()
+    print("  --sandbox   Run paper trading with real-time 1-min visualization")
+    print("  --comp      Run competition advisory desk with 24h routing rules  (default)")
+    print("  --clear     Purge all local state, caches, and Discord dashboard")
+    print("  " + "-" * 50 + "\n")
+    return "COMPETITION"
+
+
 def main():
-    handle_reset()
+    RUN_MODE = parse_args_and_mode()
 
     print(f"\n{'='*80}")
     print(f"  GLASSBOX FINANCE — Twin-Clock Architecture")

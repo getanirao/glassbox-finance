@@ -31,6 +31,7 @@ SANDBOX_LEDGER = "sandbox_history.json"
 NEWS_CACHE_FILE = ".news_cache.json"
 ROLLING_WINDOW_HOURS = 24
 MESSAGE_STATE_FILE = ".message_state"
+NEWS_MESSAGE_STATE_FILE = ".news_message_state"
 OBSERVATION_FILE = ".observation_state"
 VOLATILITY_THRESHOLD = 0.005
 VOLATILITY_WINDOW = 5
@@ -70,7 +71,12 @@ def save_news_cache(cache):
 
 
 def prune_news_cache(cache):
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=ROLLING_WINDOW_HOURS)
+    weekday = datetime.datetime.now(datetime.timezone.utc).weekday()
+    if weekday in (1, 2, 3, 4):
+        window_hours = 24
+    else:
+        window_hours = 72
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=window_hours)
     before = len(cache["headlines"])
     surviving = []
     for h in cache["headlines"]:
@@ -81,7 +87,7 @@ def prune_news_cache(cache):
         if ts >= cutoff:
             surviving.append(h)
     cache["headlines"] = surviving
-    return before - len(surviving)
+    return before - len(surviving), window_hours
 
 
 def compute_rolling_sentiment(entries, ticker):
@@ -109,6 +115,18 @@ def load_message_state():
 
 def save_message_state(message_id):
     with open(MESSAGE_STATE_FILE, "w") as f:
+        f.write(message_id.strip())
+
+
+def load_news_message_state():
+    if os.path.exists(NEWS_MESSAGE_STATE_FILE):
+        with open(NEWS_MESSAGE_STATE_FILE, "r") as f:
+            return f.read().strip()
+    return None
+
+
+def save_news_message_state(message_id):
+    with open(NEWS_MESSAGE_STATE_FILE, "w") as f:
         f.write(message_id.strip())
 
 
@@ -238,7 +256,7 @@ def send_or_update_dashboard(payload, image_path=None):
                 with open(image_path, "rb") as f:
                     resp = requests.patch(
                         edit_url,
-                        data={"content": payload},
+                        data={"payload_json": json.dumps({"content": payload, "attachments": []})},
                         files={"file": (os.path.basename(image_path), f, "image/png")},
                         timeout=15
                     )
@@ -309,6 +327,83 @@ def send_news_flash(r):
 
     payload = "\n".join(lines)
     send_webhook_payload(payload, f"News Flash - {ticker}")
+
+
+def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_neg, rolling_count):
+    if not headlines:
+        return f"{ticker} [{rolling_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> No headlines."
+
+    best_h = headlines[0]
+    best_abs = -1.0
+    for h in headlines:
+        tokens = re.findall(r"[a-z]+", h.lower())
+        pos = sum(1 for t in tokens if t in POSITIVE_LEXICON)
+        neg = sum(1 for t in tokens if t in NEGATIVE_LEXICON)
+        total = pos + neg
+        net = (pos - neg) / total if total > 0 else 0.0
+        if abs(net) > best_abs:
+            best_abs = abs(net)
+            best_h = h
+
+    if len(best_h) > 130:
+        truncated = best_h[:130]
+        last_space = truncated.rfind(" ")
+        if last_space > 0:
+            truncated = truncated[:last_space]
+        best_h = truncated + "\u2026"
+
+    return f"{ticker} [{rolling_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> {best_h}"
+
+
+def build_news_roundup(alerts, et_now):
+    lines = []
+    lines.append("=" * 80)
+    lines.append("                         GLASSBOX NEWS ROUNDUP")
+    lines.append("=" * 80)
+    for r in alerts:
+        row = summarize_news_entry(
+            r["ticker"], r.get("headlines", []),
+            r["sentiment"], r["rolling_pos"], r["rolling_neg"], r["rolling_count"]
+        )
+        lines.append(f"  {row}")
+    lines.append("=" * 80)
+    lines.append(f"  Timestamp: {et_now.strftime('%Y-%m-%d %H:%M %Z')}  |  24h Rolling Window Active")
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+def send_batched_news(alerts, et_now):
+    if not alerts:
+        return
+    payload = build_news_roundup(alerts, et_now)
+
+    webhook_url = os.environ.get("WEBHOOK_URL", "")
+    if not webhook_url:
+        print("\n  [News Roundup] Webhook URL not configured.")
+        return
+
+    wh_id, wh_token = parse_webhook_parts(webhook_url)
+    if not wh_id or not wh_token:
+        print("\n  [News Roundup] Could not parse webhook URL.")
+        return
+
+    existing_id = load_news_message_state()
+
+    try:
+        if existing_id:
+            edit_url = f"https://discord.com/api/webhooks/{wh_id}/{wh_token}/messages/{existing_id}"
+            resp = requests.patch(edit_url, json={"content": payload}, timeout=15)
+        else:
+            post_url = webhook_url.rstrip("/") + "?wait=true"
+            resp = requests.post(post_url, json={"content": payload}, timeout=15)
+            msg_id = resp.json().get("id")
+            if msg_id:
+                save_news_message_state(msg_id)
+
+        resp.raise_for_status()
+        print(f"\n  [News Roundup] Transmitted ({len(alerts)} tickers).")
+    except Exception as e:
+        print(f"\n  [News Roundup] Transmission failed - {e}.")
 
 
 def build_master_payload(results, market_state, et_now, total_tickers, clock_state=None):
@@ -602,7 +697,9 @@ def check_market_clock():
     is_market_hours = open_minutes <= current_time_minutes < close_minutes
     if is_weekday and is_market_hours:
         return "MARKET_OPEN", now
-    return "ANALYTICAL_OFF_HOURS", now
+    # TEMP OVERRIDE — force MARKET_OPEN for portfolio testing
+    return "MARKET_OPEN", now
+    # return "ANALYTICAL_OFF_HOURS", now
 
 
 def load_sandbox_ledger():
@@ -752,6 +849,25 @@ def handle_reset():
     else:
         msg_status = "not found"
 
+    if os.path.exists(NEWS_MESSAGE_STATE_FILE):
+        with open(NEWS_MESSAGE_STATE_FILE, "r") as f:
+            news_stored_id = f.read().strip()
+        if news_stored_id:
+            webhook_url = os.environ.get("WEBHOOK_URL", "")
+            wh_id, wh_token = parse_webhook_parts(webhook_url) if webhook_url else (None, None)
+            if wh_id and wh_token:
+                try:
+                    delete_url = f"https://discord.com/api/webhooks/{wh_id}/{wh_token}/messages/{news_stored_id}"
+                    resp = requests.delete(delete_url, timeout=15)
+                    resp.raise_for_status()
+                    print(f"\n  [Discord Sync] News roundup message ID [{news_stored_id}] successfully purged from channel history.")
+                except Exception as e:
+                    print(f"\n  [Discord Sync] Warning: could not purge news roundup message - {e}")
+        os.remove(NEWS_MESSAGE_STATE_FILE)
+        news_msg_status = "deleted"
+    else:
+        news_msg_status = "not found"
+
     if os.path.exists(PIPELINE_PATH):
         with open(PIPELINE_PATH, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -780,6 +896,7 @@ def handle_reset():
     print(f"  .news_cache.json:    {cache_status}")
     print(f"  .observation_state:  {obs_status}")
     print(f"  .message_state:      {msg_status}")
+    print(f"  .news_message_state: {news_msg_status}")
     print(f"  PIPELINE.md:         {pipeline_status}")
     print(f"  System reset complete. Ready for new epoch.")
     print(f"{'='*80}")
@@ -837,9 +954,9 @@ def main():
     while True:
         cycle_start = datetime.datetime.now(datetime.timezone.utc)
 
-        pruned = prune_news_cache(news_cache)
+        pruned, window_hours = prune_news_cache(news_cache)
         if pruned > 0:
-            print(f"  [Cache] Pruned {pruned} headline(s) older than {ROLLING_WINDOW_HOURS}h window.")
+            print(f"  [Cache] Pruned {pruned} headline(s) older than {window_hours}h window.")
 
         market_state, et_now = check_market_clock()
 
@@ -858,8 +975,7 @@ def main():
                     except Exception as e:
                         print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
                 save_news_cache(news_cache)
-                for r in news_alerts:
-                    send_news_flash(r)
+                send_batched_news(news_alerts, et_now)
                 display_portfolio_table(passed_results)
                 send_master_report(passed_results, market_state, et_now, len(TICKERS))
                 mark_daily_allocation()
@@ -916,8 +1032,7 @@ def main():
                     except Exception as e:
                         print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
                 save_news_cache(news_cache)
-                for r in news_alerts:
-                    send_news_flash(r)
+                send_batched_news(news_alerts, et_now)
                 ranked = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)
                 total_score = sum(r["adjusted_score"] for r in ranked) if ranked else 1
                 sandbox_execute(ranked, total_score)
@@ -946,4 +1061,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{'=' * 80}")
+        print(f"                             ENGINE SYSTEM TERMINATED")
+        print(f"{'=' * 80}")
+        print(f"  [System]: Background tracking scrawler loops successfully suspended by user.")
+        print(f"  [Status]: Core operational data cache and local state files preserved safely.")
+        print(f"{'=' * 80}")
+        sys.exit(0)

@@ -1,5 +1,6 @@
 import sys
 import os
+import math
 import datetime
 import re
 import yfinance as yf
@@ -9,10 +10,13 @@ pd.set_option("display.max_columns", 10)
 pd.set_option("display.width", 120)
 pd.set_option("display.max_rows", 200)
 
+STARTING_CAPITAL = 100000
 GATE_FILE = ".last_run"
 GATE_HOURS = 24
 
 TICKERS = ["AAPL", "MSFT", "GOOGL", "JPM", "GS", "JNJ", "PFE", "AMZN", "WMT", "XOM"]
+
+INSTITUTIONAL_BANKS = {"JPM", "GS"}
 
 POSITIVE_LEXICON = {
     "revenue", "growth", "beats", "beat", "profit", "upgrade", "upgraded",
@@ -156,22 +160,38 @@ def process_ticker(ticker, index, total):
         print(f"  [{index}/{total}] {ticker} SKIPPED - No balance sheet data.")
         return None
 
-    solvency_ok, health_score, cr, dte = evaluate_solvency(bs)
-    if solvency_ok is None:
-        print(f"  [{index}/{total}] {ticker} SKIPPED - Solvency line items not found.")
-        return None
+    if ticker in INSTITUTIONAL_BANKS:
+        print(f"  [{index}/{total}] [Sector Notice] Skipping solvency gate for {ticker} due to financial institution banking book structures.")
+        print(f"  [{index}/{total}] Assigning baseline neutral safety score (75.0/100).")
+        solvency_ok = True
+        health_score = 75.0
+        cr = None
+        dte = None
+    else:
+        solvency_ok, health_score, cr, dte = evaluate_solvency(bs)
+        if solvency_ok is None:
+            print(f"  [{index}/{total}] {ticker} SKIPPED - Solvency line items not found.")
+            return None
 
-    if not solvency_ok:
-        print(f"  [{index}/{total}] {ticker} FAILED solvency (CR={cr:.2f}, D/E={dte:.2f}).")
-        return None
+        if not solvency_ok:
+            print(f"  [{index}/{total}] {ticker} FAILED solvency (CR={cr:.2f}, D/E={dte:.2f}).")
+            if dte is not None and dte > 1.5:
+                print(f"  [{index}/{total}] [Semantic Analysis]: High leverage indicates this enterprise relies heavily on debt financing, making it highly vulnerable to capital insolvency during contractionary macroeconomic cycles.")
+            if cr is not None and cr < 1.2:
+                print(f"  [{index}/{total}] [Semantic Analysis]: Short-term liquidity bounds are breached, indicating the company mathematically lacks the liquid assets required to satisfy its immediate operational obligations over the next fiscal year.")
+            return None
 
     net_sentiment, penalty = sentiment_gate(stock)
+    if net_sentiment < 0.0:
+        print(f"  [{index}/{total}] [Semantic Analysis]: Computational linguistics detect high rhetorical negative sentiment across public news sources, indicating structural headline risk that down-weights our core fundamental asset valuation.")
     adjusted_score = health_score * penalty
 
-    print(f"  [{index}/{total}] {ticker} PASSED (Score: {adjusted_score:.1f}/100)")
+    status = "PASS (Bank Neutral)" if ticker in INSTITUTIONAL_BANKS else "PASS"
+    print(f"  [{index}/{total}] {ticker} {status} (Score: {adjusted_score:.1f}/100)")
 
     return {
         "ticker": ticker,
+        "status": status,
         "health_score": health_score,
         "current_ratio": cr,
         "debt_to_equity": dte,
@@ -184,35 +204,111 @@ def process_ticker(ticker, index, total):
 def display_portfolio_table(results):
     if not results:
         print(f"\n{'='*80}")
-        print(f"  PORTFOLIO RESULT")
+        print(f"  PORTFOLIO DASHBOARD")
         print(f"{'='*80}")
         print(f"  No tickers passed all gates. Portfolio is empty.")
         print(f"{'='*80}")
         return
 
-    total_score = sum(r["adjusted_score"] for r in results)
+    ranked = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
+    total_score = sum(r["adjusted_score"] for r in ranked)
+
+    print(f"\n{'='*90}")
+    print(f"  PORTFOLIO DASHBOARD — Allocation of ${STARTING_CAPITAL:,}")
+    print(f"{'='*90}")
+    header = f"  {'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'Dollar Amt':>12} {'Shares':>8}"
+    print(header)
+    print(f"  {'------':<8} {'----------------------':<22} {'----------':>10} {'----------':>10} {'-----------':>12} {'-------':>8}")
+
+    for r in ranked:
+        ticker = r["ticker"]
+        status = r["status"]
+        sent = r["sentiment"]
+        score = r["adjusted_score"]
+        pct = score / total_score * 100 if total_score > 0 else 0
+        dollar_alloc = STARTING_CAPITAL * (pct / 100)
+
+        try:
+            stock = yf.Ticker(ticker)
+            price = stock.fast_info.last_price
+            if price is None or price <= 0:
+                hist = stock.history(period="1d")
+                price = hist["Close"].iloc[-1] if not hist.empty else 0
+        except Exception:
+            price = 0
+
+        if price and price > 0:
+            target_shares = int(dollar_alloc / price)
+        else:
+            target_shares = 0
+
+        sent_label = f"{sent:+.3f}"
+        print(f"  {ticker:<8} {status:<22} {sent_label:>10} {pct:>9.2f}% ${dollar_alloc:>9,.2f} {target_shares:>7}")
+
+    print(f"  {'------':<8} {'----------------------':<22} {'----------':>10} {'----------':>10} {'-----------':>12} {'-------':>8}")
+    total_alloc = sum(
+        STARTING_CAPITAL * (r["adjusted_score"] / total_score / 100)
+        if total_score > 0 else 0
+        for r in ranked
+    )
+    print(f"  {'TOTAL':<8} {'':<22} {'':>10} {'100.00%':>10} ${STARTING_CAPITAL:>9,.2f} {'':>7}")
+    print(f"{'='*90}")
+
+
+def handle_reset():
+    if "--clear" not in sys.argv:
+        return
+
+    PIPELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PIPELINE.md")
+
+    if os.path.exists(GATE_FILE):
+        os.remove(GATE_FILE)
+        gate_status = "deleted"
+    else:
+        gate_status = "not found"
+
+    if os.path.exists(PIPELINE_PATH):
+        with open(PIPELINE_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        divider_indices = [i for i, line in enumerate(lines) if line.strip() == "---"]
+
+        if len(divider_indices) >= 2:
+            keep_start = divider_indices[0] + 1
+            keep_end = divider_indices[-1]
+            new_lines = lines[:keep_start] + lines[keep_end:]
+        else:
+            new_lines = lines
+
+        cleaned = [new_lines[0]]
+        for line in new_lines[1:]:
+            if line.strip() == "---" and cleaned[-1].strip() == "---":
+                continue
+            cleaned.append(line)
+
+        with open(PIPELINE_PATH, "w", encoding="utf-8") as f:
+            f.writelines(cleaned)
+        pipeline_status = "log entries cleared"
+    else:
+        pipeline_status = "not found"
 
     print(f"\n{'='*80}")
-    print(f"  PORTFOLIO RANKING TABLE")
+    print(f"  SYSTEM RESET")
     print(f"{'='*80}")
-    print(f"  {'Ticker':<8} {'Health':>8} {'CR':>8} {'D/E':>8} {'Sent':>8} {'Penalty':>8} {'Final':>8} {'Weight':>8}")
-    print(f"  {'------':<8} {'------':>8} {'---':>8} {'----':>8} {'----':>8} {'-------':>8} {'-----':>8} {'------':>8}")
-
-    for r in sorted(results, key=lambda x: x["adjusted_score"], reverse=True):
-        weight = (r["adjusted_score"] / total_score * 100) if total_score > 0 else 0
-        print(f"  {r['ticker']:<8} {r['health_score']:>7.1f} {r['current_ratio']:>7.2f} {r['debt_to_equity']:>7.2f} {r['sentiment']:>+7.3f} {r['penalty']:>7.2f}x {r['adjusted_score']:>7.1f} {weight:>6.1f}%")
-
-    print(f"  {'------':<8} {'------':>8} {'---':>8} {'----':>8} {'----':>8} {'-------':>8} {'-----':>8} {'------':>8}")
-    print(f"  {'TOTAL':<8} {'':>8} {'':>8} {'':>8} {'':>8} {'':>8} {total_score:>7.1f} {'100.0%':>8}")
+    print(f"  .last_run:       {gate_status}")
+    print(f"  PIPELINE.md:     {pipeline_status}")
+    print(f"  System reset complete. Ready for new epoch.")
     print(f"{'='*80}")
+    sys.exit(0)
 
 
 def main():
+    handle_reset()
     check_time_gate()
 
     print(f"\n{'='*80}")
     print(f"  PHASE 3 — PORTFOLIO-WIDE EVALUATION")
-    print(f"  Universe: {len(TICKERS)} tickers across Technology, Finance, Healthcare, Consumer, Energy")
+    print(f"  Starting Capital: ${STARTING_CAPITAL:,}  |  Universe: {len(TICKERS)} tickers")
     print(f"{'='*80}")
 
     results = []

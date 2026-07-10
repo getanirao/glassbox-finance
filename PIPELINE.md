@@ -39,6 +39,11 @@
 - **Reason:** Phase 3 freeze — all core quantitative pipeline, Discord notification, and sandbox simulation features verified and stable
 - **Files:** `main.py`, `README.md`, `PIPELINE.md`, `MODEL_GUIDE.md`, `.env`, `.gitignore`
 
+### 2026-07-10 21:10 (UTC)
+- **Change:** Refactored to twin-clock architecture — **24-Hour Decision Clock** restricts core re-allocations (solvency, sentiment, holdings changes) to once per day in both modes. **1-Minute Visualization Clock** in SANDBOX runs independent 60s cycles pulling only spot prices, calculating net worth, updating `sandbox_history.json`, and re-plotting `sandbox_performance.png` without changing holdings. Added `load_observation_state()` / `save_observation_state()` / `collect_spot_prices()` / `compute_volatility_spread()` / `volatility_stabilized()` / `visualization_update()`. Added volatility suppression execution trigger — when 24h gate expires, engine enters OBSERVING state; only executes daily rebalance when 5-minute average volatility spread drops below threshold (0.5%) or 30-minute market-open grace period elapses. Dashboard displays live clock state (`LOCKED`, `OBSERVING INTRA-DAY VOLATILITY`, `UPDATING REAL-TIME VALUE`) via `build_sandbox_status()`. COMPETITION mode restored to standard 60-min/24h-gate loop.
+- **Reason:** Phase 4 — twin-clock decoupling eliminates intra-day whipsaw timing risk by separating capital allocation decisions (daily) from real-time portfolio visualization (1-minute)
+- **Files:** `main.py`, `README.md`
+
 ---
 
 _[System Note: Archive active at `history/LOG_ARCHIVE_V1.md` | Current Archive Entries: 6]_

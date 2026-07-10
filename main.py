@@ -30,6 +30,10 @@ SANDBOX_LEDGER = "sandbox_history.json"
 NEWS_CACHE_FILE = ".news_cache.json"
 ROLLING_WINDOW_HOURS = 24
 MESSAGE_STATE_FILE = ".message_state"
+OBSERVATION_FILE = ".observation_state"
+VOLATILITY_THRESHOLD = 0.005
+VOLATILITY_WINDOW = 5
+GRACE_MINUTES = 30
 
 TICKERS = ["AAPL", "MSFT", "GOOGL", "JPM", "GS", "JNJ", "PFE", "AMZN", "WMT", "XOM"]
 
@@ -113,6 +117,105 @@ def parse_webhook_parts(url):
     if len(parts) >= 2:
         return parts[-2], parts[-1]
     return None, None
+
+
+def load_observation_state():
+    if os.path.exists(OBSERVATION_FILE):
+        with open(OBSERVATION_FILE, "r") as f:
+            return json.load(f)
+    return {"clock_state": "LOCKED", "observation_start": None, "price_log": {}}
+
+
+def save_observation_state(state):
+    with open(OBSERVATION_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def collect_spot_prices(state, tickers):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    if "price_log" not in state:
+        state["price_log"] = {}
+    for ticker in tickers:
+        if ticker not in state["price_log"]:
+            state["price_log"][ticker] = []
+        try:
+            stock = yf.Ticker(ticker)
+            price = stock.fast_info.last_price
+            if price is None or price <= 0:
+                hist = stock.history(period="1d")
+                price = hist["Close"].iloc[-1] if not hist.empty else None
+            if price and price > 0:
+                state["price_log"][ticker].append({"t": now.isoformat(), "p": price})
+                if len(state["price_log"][ticker]) > 10:
+                    state["price_log"][ticker] = state["price_log"][ticker][-10:]
+        except Exception:
+            pass
+
+
+def compute_volatility_spread(price_log):
+    spreads = []
+    for ticker, prices in price_log.items():
+        if len(prices) < 2:
+            continue
+        recent = [p["p"] for p in prices[-VOLATILITY_WINDOW:]]
+        if len(recent) < 2:
+            continue
+        returns = [(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))]
+        if not returns:
+            continue
+        mean = sum(returns) / len(returns)
+        variance = sum((r - mean) ** 2 for r in returns) / len(returns)
+        spreads.append(math.sqrt(variance))
+    if not spreads:
+        return float('inf')
+    return sum(spreads) / len(spreads)
+
+
+def volatility_stabilized(state):
+    if state.get("clock_state") != "OBSERVING":
+        return False
+    obs_start = datetime.datetime.fromisoformat(state["observation_start"])
+    elapsed = datetime.datetime.now(datetime.timezone.utc) - obs_start
+    if elapsed >= datetime.timedelta(minutes=GRACE_MINUTES):
+        return True
+    spread = compute_volatility_spread(state.get("price_log", {}))
+    return spread < VOLATILITY_THRESHOLD
+
+
+def visualization_update():
+    ledger = load_sandbox_ledger()
+    total_holdings_value = 0
+    for ticker, pos in ledger["holdings"].items():
+        try:
+            stock = yf.Ticker(ticker)
+            price = stock.fast_info.last_price
+            if price is None or price <= 0:
+                hist = stock.history(period="1d")
+                price = hist["Close"].iloc[-1] if not hist.empty else 0
+        except Exception:
+            price = 0
+        total_holdings_value += pos["shares"] * price
+    portfolio_value = ledger["cash_balance"] + total_holdings_value
+    ledger["history"].append({
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "portfolio_value": round(portfolio_value, 2),
+    })
+    save_sandbox_ledger(ledger)
+    generate_portfolio_chart(ledger)
+    return ledger
+
+
+def build_sandbox_status(ledger, clock_state, et_now):
+    pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL
+    change = pv - STARTING_CAPITAL
+    pct = (change / STARTING_CAPITAL) * 100
+    arrow = "+" if change >= 0 else ""
+    lines = []
+    lines.append(f"**Glassbox Finance — SANDBOX DASHBOARD**")
+    lines.append(f"Status: MARKET_OPEN — Clock: {clock_state}  |  {et_now.strftime('%H:%M UTC')}")
+    lines.append(f"Portfolio: ${pv:,.2f}  ({arrow}{change:,.2f} / {arrow}{pct:.2f}%)")
+    lines.append(f"Cash: ${ledger['cash_balance']:,.2f}  |  Holdings: {len(ledger['holdings'])} positions")
+    return "\n".join(lines)
 
 
 def send_or_update_dashboard(payload, image_path=None):
@@ -207,13 +310,16 @@ def send_news_flash(r):
     send_webhook_payload(payload, f"News Flash - {ticker}")
 
 
-def build_master_payload(results, market_state, et_now, total_tickers):
+def build_master_payload(results, market_state, et_now, total_tickers, clock_state=None):
     ranked = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
     total_score = sum(r["adjusted_score"] for r in ranked) if ranked else 1
 
     lines = []
     lines.append("**Glassbox Finance - MASTER EXECUTION REPORT**")
-    lines.append(f"Status: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
+    if clock_state:
+        lines.append(f"Status: {market_state} — Clock: {clock_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
+    else:
+        lines.append(f"Status: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
     lines.append(f"Capital: ${STARTING_CAPITAL:,}  |  Universe: {total_tickers} tickers")
     lines.append("")
     lines.append("```")
@@ -623,6 +729,12 @@ def handle_reset():
     else:
         cache_status = "not found"
 
+    if os.path.exists(OBSERVATION_FILE):
+        os.remove(OBSERVATION_FILE)
+        obs_status = "deleted"
+    else:
+        obs_status = "not found"
+
     if os.path.exists(MESSAGE_STATE_FILE):
         with open(MESSAGE_STATE_FILE, "r") as f:
             stored_id = f.read().strip()
@@ -666,10 +778,11 @@ def handle_reset():
     print(f"\n{'='*80}")
     print(f"  SYSTEM RESET")
     print(f"{'='*80}")
-    print(f"  .last_run:        {gate_status}")
-    print(f"  .news_cache.json:  {cache_status}")
-    print(f"  .message_state:    {msg_status}")
-    print(f"  PIPELINE.md:      {pipeline_status}")
+    print(f"  .last_run:           {gate_status}")
+    print(f"  .news_cache.json:    {cache_status}")
+    print(f"  .observation_state:  {obs_status}")
+    print(f"  .message_state:      {msg_status}")
+    print(f"  PIPELINE.md:         {pipeline_status}")
     print(f"  System reset complete. Ready for new epoch.")
     print(f"{'='*80}")
     sys.exit(0)
@@ -679,7 +792,7 @@ def main():
     handle_reset()
 
     print(f"\n{'='*80}")
-    print(f"  GLASSBOX FINANCE — Continuous News Streaming Framework")
+    print(f"  GLASSBOX FINANCE — Twin-Clock Architecture")
     print(f"  Mode: {RUN_MODE}  |  Universe: {len(TICKERS)} tickers")
     print(f"{'='*80}")
 
@@ -693,64 +806,107 @@ def main():
             print(f"  [Cache] Pruned {pruned} headline(s) older than {ROLLING_WINDOW_HOURS}h window.")
 
         market_state, et_now = check_market_clock()
-        daily_allowed = check_daily_gate()
 
-        sandbox_hyper = (RUN_MODE == "SANDBOX" and market_state == "MARKET_OPEN")
-        if sandbox_hyper:
-            should_allocate = True
-            sleep_seconds = 60
-        else:
-            should_allocate = (daily_allowed and market_state == "MARKET_OPEN")
-            sleep_seconds = LOOP_INTERVAL_MINUTES * 60
-
-        print(f"\n  Cycle: {cycle_start.strftime('%Y-%m-%d %H:%M UTC')}  |  Market: {market_state}  |  {'Hyper 60s' if sandbox_hyper else 'Standard ' + str(LOOP_INTERVAL_MINUTES) + 'min'}")
-        print(f"  {'='*80}")
-
-        news_alerts = []
-        passed_results = []
-
-        for i, ticker in enumerate(TICKERS, start=1):
-            try:
-                result = process_ticker(ticker, i, len(TICKERS), news_cache)
-                if result is not None:
-                    news_alerts.append(result)
-                    if result["passed"]:
-                        passed_results.append(result)
-            except Exception as e:
-                print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
-
-        save_news_cache(news_cache)
-
-        print(f"\n  Sending news alerts to team webhook ...")
-        for r in news_alerts:
-            send_news_flash(r)
-
-        if should_allocate:
-            print(f"\n  Allocation gate OPEN — computing capital distribution ...")
-            if sandbox_hyper:
-                ranked = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)
-                total_score = sum(r["adjusted_score"] for r in ranked) if ranked else 1
-                sandbox_execute(ranked, total_score)
-                payload = build_master_payload(passed_results, market_state, et_now, len(TICKERS))
-                send_or_update_dashboard(payload, image_path="sandbox_performance.png")
-            else:
+        if RUN_MODE == "COMPETITION":
+            daily_allowed = check_daily_gate()
+            if daily_allowed and market_state == "MARKET_OPEN":
+                news_alerts = []
+                passed_results = []
+                for i, ticker in enumerate(TICKERS, start=1):
+                    try:
+                        result = process_ticker(ticker, i, len(TICKERS), news_cache)
+                        if result is not None:
+                            news_alerts.append(result)
+                            if result["passed"]:
+                                passed_results.append(result)
+                    except Exception as e:
+                        print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
+                save_news_cache(news_cache)
+                for r in news_alerts:
+                    send_news_flash(r)
                 display_portfolio_table(passed_results)
                 send_master_report(passed_results, market_state, et_now, len(TICKERS))
                 mark_daily_allocation()
                 print(f"  [Gate] Daily allocation executed and timestamped.")
-        else:
-            if sandbox_hyper:
-                print(f"  [Gate] Allocating every 60s — hyper mode active.")
             else:
                 if not daily_allowed:
-                    print(f"  [Gate] Daily allocation skipped — 24h cooldown active.")
+                    print(f"  [Gate] 24h cooldown active — skipped.")
                 if market_state != "MARKET_OPEN":
-                    print(f"  [Gate] Daily allocation skipped — outside NYSE market hours.")
+                    print(f"  [Gate] Outside NYSE hours — skipped.")
+            print(f"\n  Next cycle +{LOOP_INTERVAL_MINUTES}min.")
+            time.sleep(LOOP_INTERVAL_MINUTES * 60)
+            continue
 
-        next_cycle = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=sleep_seconds)
-        print(f"\n  Next cycle at {next_cycle.strftime('%Y-%m-%d %H:%M UTC')} (+{sleep_seconds}s).")
+        # === SANDBOX TWIN-CLOCK ===
+        if market_state != "MARKET_OPEN":
+            print(f"  [Clock] Market closed — 60min standby.")
+            print(f"  {'='*80}")
+            time.sleep(LOOP_INTERVAL_MINUTES * 60)
+            continue
+
+        daily_allowed = check_daily_gate()
+        obs_state = load_observation_state()
+        clock_label = obs_state.get("clock_state", "LOCKED")
+
+        print(f"\n  [{cycle_start.strftime('%H:%M UTC')}] MARKET_OPEN  |  24-Hour Gate: {'EXPIRED' if daily_allowed else 'LOCKED'}  |  Observation Clock: {clock_label}")
         print(f"  {'='*80}")
-        time.sleep(sleep_seconds)
+
+        if daily_allowed and clock_label == "LOCKED":
+            obs_state["clock_state"] = "OBSERVING"
+            obs_state["observation_start"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            obs_state["price_log"] = {}
+            save_observation_state(obs_state)
+            collect_spot_prices(obs_state, TICKERS)
+            save_observation_state(obs_state)
+            ledger = visualization_update()
+            payload = build_sandbox_status(ledger, "OBSERVING INTRA-DAY VOLATILITY", et_now)
+            send_or_update_dashboard(payload, image_path="sandbox_performance.png" if os.path.exists("sandbox_performance.png") else None)
+            print(f"  [Smart Trigger] Entering observation state — collecting volatility data.")
+
+        elif clock_label == "OBSERVING":
+            collect_spot_prices(obs_state, TICKERS)
+            save_observation_state(obs_state)
+            if volatility_stabilized(obs_state):
+                print(f"  [Smart Trigger]: Market volatility stabilized. Executing daily portfolio rebalance and locking decision gate for 24 hours.")
+                news_alerts = []
+                passed_results = []
+                for i, ticker in enumerate(TICKERS, start=1):
+                    try:
+                        result = process_ticker(ticker, i, len(TICKERS), news_cache)
+                        if result is not None:
+                            news_alerts.append(result)
+                            if result["passed"]:
+                                passed_results.append(result)
+                    except Exception as e:
+                        print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
+                save_news_cache(news_cache)
+                for r in news_alerts:
+                    send_news_flash(r)
+                ranked = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)
+                total_score = sum(r["adjusted_score"] for r in ranked) if ranked else 1
+                sandbox_execute(ranked, total_score)
+                mark_daily_allocation()
+                obs_state["clock_state"] = "LOCKED"
+                obs_state["price_log"] = {}
+                save_observation_state(obs_state)
+                ledger = load_sandbox_ledger()
+                payload = build_master_payload(passed_results, market_state, et_now, len(TICKERS), clock_state="LOCKED")
+                send_or_update_dashboard(payload, image_path="sandbox_performance.png")
+            else:
+                ledger = visualization_update()
+                spread = compute_volatility_spread(obs_state.get("price_log", {}))
+                print(f"  [Volatility] Current spread: {spread:.6f}  |  Threshold: {VOLATILITY_THRESHOLD}  |  Waiting for stabilization.")
+                payload = build_sandbox_status(ledger, "OBSERVING INTRA-DAY VOLATILITY", et_now)
+                send_or_update_dashboard(payload, image_path="sandbox_performance.png" if os.path.exists("sandbox_performance.png") else None)
+
+        else:
+            ledger = visualization_update()
+            payload = build_sandbox_status(ledger, "UPDATING REAL-TIME VALUE", et_now)
+            send_or_update_dashboard(payload, image_path="sandbox_performance.png" if os.path.exists("sandbox_performance.png") else None)
+
+        print(f"  [Next] +60s.")
+        print(f"  {'='*80}")
+        time.sleep(60)
 
 
 if __name__ == "__main__":

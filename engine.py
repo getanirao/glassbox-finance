@@ -1147,6 +1147,7 @@ class EngineRunner:
                 collect_spot_prices(obs_state, TICKERS)
                 save_observation_state(obs_state)
                 if volatility_stabilized(obs_state):
+                    print(f"  [DEBUG] Market state before rebalance check: {market_state}")
                     if market_state == "MARKET_OPEN":
                         print(f"  [Smart Trigger]: Market volatility stabilized. Executing daily portfolio rebalance and locking decision gate for 24 hours.")
                         news_alerts = []

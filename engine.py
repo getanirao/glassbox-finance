@@ -501,6 +501,11 @@ def build_sandbox_status(ledger, clock_state, et_now):
     lines.append(f"Scanner: {WATCHLIST_SCANNER_LIMIT} tickers | Holdings: {len(ledger['holdings'])} / {MAX_PORTFOLIO_HOLDINGS}")
     lines.append(f"Portfolio: ${pv:,.2f}  ({arrow}{change:,.2f} / {arrow}{pct:.2f}%)")
     lines.append(f"Cash: ${ledger['cash_balance']:,.2f}")
+    last = ledger["history"][-1] if ledger["history"] else {}
+    if last.get("realized_pnl"):
+        rp = last["realized_pnl"]
+        rp_arrow = "+" if rp >= 0 else ""
+        lines.append(f"Realized P&L: {rp_arrow}${rp:,.2f}")
     return "\n".join(lines)
 
 
@@ -732,14 +737,7 @@ def visualization_update():
     ledger = load_sandbox_ledger()
     total_holdings_value = 0
     for ticker, pos in ledger["holdings"].items():
-        try:
-            stock = yf.Ticker(ticker)
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else 0
-        except Exception:
-            price = 0
+        price = _get_price(ticker)
         total_holdings_value += pos["shares"] * price
     portfolio_value = ledger["cash_balance"] + total_holdings_value
     ledger["history"].append({
@@ -779,59 +777,94 @@ def generate_portfolio_chart(ledger):
     print(f"  [Chart] {SANDBOX_CHART} saved ({len(history)} data points).")
 
 
+def _get_price(ticker):
+    try:
+        stock = yf.Ticker(ticker)
+        price = stock.fast_info.last_price
+        if price is None or price <= 0:
+            hist = stock.history(period="1d")
+            price = hist["Close"].iloc[-1] if not hist.empty else 0
+        return price
+    except Exception:
+        return 0
+
+
 def sandbox_execute(ranked, total_score):
     ledger = load_sandbox_ledger()
+    new_tickers = {r["ticker"] for r in ranked}
+
     print(f"\n{'='*80}")
-    print(f"  SANDBOX EXECUTION — Auto-Purchasing Passed Tickers")
+    print(f"  SANDBOX EXECUTION — Portfolio Rebalance (Sell / Hold / Buy)")
     print(f"{'='*80}")
-    print(f"  Cash Reserve: ${ledger['cash_balance']:,.2f}")
-    print(f"  Holdings:     {len(ledger['holdings'])} positions")
+    print(f"  Cash:           ${ledger['cash_balance']:>10,.2f}")
+    print(f"  Current Holdings: {len(ledger['holdings'])} positions")
     print(f"{'='*80}")
-    for r in ranked:
+
+    realized_pnl = 0.0
+
+    # Phase 1: SELL — exit held positions not in new allocation
+    for ticker in list(ledger["holdings"].keys()):
+        if ticker in new_tickers:
+            continue
+        pos = ledger["holdings"][ticker]
+        price = _get_price(ticker)
+        if price and price > 0:
+            proceeds = pos["shares"] * price
+            cost_basis = pos["shares"] * pos["avg_price"]
+            pnl = proceeds - cost_basis
+            realized_pnl += pnl
+            ledger["cash_balance"] += proceeds
+            del ledger["holdings"][ticker]
+            print(f"  SELL  {pos['shares']} shares of {ticker} @ ${price:.2f}  (P&L: ${pnl:+,.2f})")
+        else:
+            print(f"  SELL  {pos['shares']} shares of {ticker} @ price N/A — skipped.")
+
+    # Phase 2: HOLD — report existing positions that stay
+    for ticker in sorted(new_tickers):
+        if ticker in ledger["holdings"]:
+            pos = ledger["holdings"][ticker]
+            price = _get_price(ticker)
+            val = pos["shares"] * price if price else 0
+            print(f"  HOLD  {pos['shares']} shares of {ticker} @ ${price:.2f}  (Value: ${val:,.2f})")
+
+    # Phase 3: BUY — new positions only
+    buy_targets = [r for r in ranked if r["ticker"] not in ledger["holdings"]]
+    buy_total_score = sum(r["adjusted_score"] for r in buy_targets) or 1
+    for r in buy_targets:
         ticker = r["ticker"]
-        score = r["adjusted_score"]
-        pct = score / total_score * 100
+        pct = r["adjusted_score"] / buy_total_score * 100
         dollar_alloc = ledger["cash_balance"] * (pct / 100)
-        try:
-            stock = yf.Ticker(ticker)
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else 0
-        except Exception:
-            price = 0
+        price = _get_price(ticker)
         if price and price > 0:
             target_shares = int(dollar_alloc / price)
             if target_shares > 0:
                 cost = target_shares * price
-                if ticker in ledger["holdings"]:
-                    existing = ledger["holdings"][ticker]
-                    total_shares = existing["shares"] + target_shares
-                    total_cost = existing["shares"] * existing["avg_price"] + cost
-                    existing["shares"] = total_shares
-                    existing["avg_price"] = total_cost / total_shares
-                else:
-                    ledger["holdings"][ticker] = {"shares": target_shares, "avg_price": price}
+                ledger["holdings"][ticker] = {"shares": target_shares, "avg_price": price}
                 ledger["cash_balance"] -= cost
-                print(f"  Purchased {target_shares} shares of {ticker} @ ${price:.2f} (${cost:,.2f})")
+                print(f"  BUY   {target_shares} shares of {ticker} @ ${price:.2f}  (${cost:,.2f})")
+
+    # Valuate
     total_holdings_value = 0
     for ticker, pos in ledger["holdings"].items():
-        try:
-            stock = yf.Ticker(ticker)
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else 0
-        except Exception:
-            price = 0
-        total_holdings_value += pos["shares"] * price
+        price = _get_price(ticker)
+        total_holdings_value += pos["shares"] * (price if price else 0)
+
     portfolio_value = ledger["cash_balance"] + total_holdings_value
-    ledger["history"].append({
+    entry = {
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "portfolio_value": round(portfolio_value, 2),
-    })
+    }
+    if realized_pnl != 0:
+        entry["realized_pnl"] = round(realized_pnl, 2)
+    ledger["history"].append(entry)
     save_sandbox_ledger(ledger)
-    print(f"\n  Portfolio Value: ${portfolio_value:,.2f}  (Cash: ${ledger['cash_balance']:,.2f} + Holdings: ${total_holdings_value:,.2f})")
+
+    print(f"\n  Portfolio Summary:")
+    print(f"  Cash:      ${ledger['cash_balance']:>10,.2f}")
+    print(f"  Holdings:  ${total_holdings_value:>10,.2f}")
+    print(f"  Total:     ${portfolio_value:>10,.2f}")
+    if realized_pnl != 0:
+        print(f"  Realized:  ${realized_pnl:>+10,.2f}")
     generate_portfolio_chart(ledger)
 
 

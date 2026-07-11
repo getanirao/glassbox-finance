@@ -4,6 +4,21 @@
 
 ---
 
+### Entry 18 — 2026-07-10T23:50:00Z
+
+**Action:** Ternary trading signals (Buy / Hold / Sell) with realized P&L tracking.
+
+**Changes:**
+- Rewrote `sandbox_execute()` with three-phase rebalance: SELL held tickers not in new allocation → HOLD existing positions that qualify → BUY new positions only
+- Added `_get_price(ticker)` helper to consolidate the 6+ duplicated yfinance price-fetching blocks
+- Added realized P&L tracking: each SELL records proceeds − cost_basis, net realized P&L per cycle saved to ledger history
+- Updated `build_sandbox_status()` to display realized P&L on Discord dashboard when available
+- Integrated `_get_price()` into `visualization_update()` for code consistency
+
+**Logic:** SELL exits positions that fail solvency or drop out of the top-12 ranking, freeing cash for stronger opportunities. HOLD keeps existing qualifying positions untouched (no averaging down). BUY allocates remaining cash proportionally to new tickers by adjusted_score. Prevents the leaky-bucket accumulation bug where the portfolio only ever grew.
+
+**Files Touched:** `engine.py`, `PIPELINE.md`, `README.md`
+
 ### Entry 17 — 2026-07-10T23:45:00Z
 
 **Action:** Exponential decay weighting for rolling sentiment + Friday 72h window correction.

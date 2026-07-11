@@ -29,17 +29,39 @@ GATE_HOURS = 24
 LOOP_INTERVAL_MINUTES = 60
 SANDBOX_LEDGER = "sandbox_history.json"
 NEWS_CACHE_FILE = ".news_cache.json"
-ROLLING_WINDOW_HOURS = 24
 MESSAGE_STATE_FILE = ".message_state"
 NEWS_MESSAGE_STATE_FILE = ".news_message_state"
 OBSERVATION_FILE = ".observation_state"
 VOLATILITY_THRESHOLD = 0.005
 VOLATILITY_WINDOW = 5
 GRACE_MINUTES = 30
+LONG_WINDOW_HOURS = 168
+LONG_SENTIMENT_WEIGHT = 0.3
+WATCHLIST_SCANNER_LIMIT = 75
+MAX_PORTFOLIO_HOLDINGS = 12
 
-TICKERS = ["AAPL", "MSFT", "GOOGL", "JPM", "GS", "JNJ", "PFE", "AMZN", "WMT", "XOM"]
+TICKERS = [
+    # Technology (14)
+    "AAPL", "MSFT", "GOOGL", "META", "NVDA", "INTC", "AMD", "CSCO",
+    "CRM", "ORCL", "IBM", "ADBE", "NFLX", "NOW",
+    # Healthcare (12)
+    "JNJ", "PFE", "UNH", "ABBV", "MRK", "ABT", "TMO", "LLY",
+    "BMY", "MDT", "DHR", "AMGN",
+    # Energy (10)
+    "XOM", "CVX", "COP", "SLB", "EOG", "OXY", "HAL", "MPC", "PSX", "VLO",
+    # Consumer Cyclical (12)
+    "AMZN", "TSLA", "HD", "MCD", "NKE", "DIS", "SBUX", "LOW",
+    "BKNG", "TGT", "TJX", "ROST",
+    # Industrials (12)
+    "CAT", "GE", "BA", "HON", "RTX", "UPS", "UNP", "LMT",
+    "GD", "CARR", "EMR", "ETN",
+    # Utilities (10)
+    "NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "PEG", "ED", "WEC",
+    # Finance (5) — bank exemption active
+    "JPM", "GS", "BAC", "MS", "C",
+]
 
-INSTITUTIONAL_BANKS = {"JPM", "GS"}
+INSTITUTIONAL_BANKS = {"JPM", "GS", "BAC", "MS", "C"}
 
 POSITIVE_LEXICON = {
     "revenue", "growth", "beats", "beat", "profit", "upgrade", "upgraded",
@@ -70,12 +92,15 @@ def save_news_cache(cache):
         json.dump(cache, f, indent=2)
 
 
-def prune_news_cache(cache):
+def get_cache_window_hours():
     weekday = datetime.datetime.now(datetime.timezone.utc).weekday()
     if weekday in (1, 2, 3, 4):
-        window_hours = 24
-    else:
-        window_hours = 72
+        return 24
+    return 72
+
+
+def prune_news_cache(cache):
+    window_hours = get_cache_window_hours()
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=window_hours)
     before = len(cache["headlines"])
     surviving = []
@@ -90,8 +115,10 @@ def prune_news_cache(cache):
     return before - len(surviving), window_hours
 
 
-def compute_rolling_sentiment(entries, ticker):
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=ROLLING_WINDOW_HOURS)
+def compute_rolling_sentiment(entries, ticker, window_hours=None):
+    if window_hours is None:
+        window_hours = get_cache_window_hours()
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=window_hours)
     ticker_entries = [
         h for h in entries
         if h["ticker"] == ticker
@@ -232,8 +259,9 @@ def build_sandbox_status(ledger, clock_state, et_now):
     lines = []
     lines.append(f"**Glassbox Finance — SANDBOX DASHBOARD**")
     lines.append(f"Status: MARKET_OPEN — Clock: {clock_state}  |  {et_now.strftime('%H:%M UTC')}")
+    lines.append(f"Scanner: {WATCHLIST_SCANNER_LIMIT} tickers | Holdings: {len(ledger['holdings'])} / {MAX_PORTFOLIO_HOLDINGS}")
     lines.append(f"Portfolio: ${pv:,.2f}  ({arrow}{change:,.2f} / {arrow}{pct:.2f}%)")
-    lines.append(f"Cash: ${ledger['cash_balance']:,.2f}  |  Holdings: {len(ledger['holdings'])} positions")
+    lines.append(f"Cash: ${ledger['cash_balance']:,.2f}")
     return "\n".join(lines)
 
 
@@ -329,9 +357,12 @@ def send_news_flash(r):
     send_webhook_payload(payload, f"News Flash - {ticker}")
 
 
-def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_neg, rolling_count):
+def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_neg, rolling_count, long_sent=None):
     if not headlines:
-        return f"{ticker} [{rolling_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> No headlines."
+        base = f"{ticker} [{rolling_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> No headlines."
+        if long_sent is not None:
+            base = f"{ticker} [{rolling_sent:+.2f} / {long_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> No headlines."
+        return base
 
     best_h = headlines[0]
     best_abs = -1.0
@@ -352,6 +383,8 @@ def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_n
             truncated = truncated[:last_space]
         best_h = truncated + "\u2026"
 
+    if long_sent is not None:
+        return f"{ticker} [{rolling_sent:+.2f} / {long_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> {best_h}"
     return f"{ticker} [{rolling_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> {best_h}"
 
 
@@ -359,15 +392,17 @@ def build_news_roundup(alerts, et_now):
     lines = []
     lines.append("=" * 80)
     lines.append("                         GLASSBOX NEWS ROUNDUP")
+    lines.append(f"  Scanner: {WATCHLIST_SCANNER_LIMIT} tickers  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
     lines.append("=" * 80)
     for r in alerts:
         row = summarize_news_entry(
             r["ticker"], r.get("headlines", []),
-            r["sentiment"], r["rolling_pos"], r["rolling_neg"], r["rolling_count"]
+            r["sentiment"], r["rolling_pos"], r["rolling_neg"], r["rolling_count"],
+            long_sent=r.get("long_sentiment")
         )
         lines.append(f"  {row}")
     lines.append("=" * 80)
-    lines.append(f"  Timestamp: {et_now.strftime('%Y-%m-%d %H:%M %Z')}  |  24h Rolling Window Active")
+    lines.append(f"  {len(alerts)} headlines  |  24h Rolling Window  |  7d Trend Anchor")
     lines.append("=" * 80)
     return "\n".join(lines)
 
@@ -408,7 +443,10 @@ def send_batched_news(alerts, et_now):
 
 def build_master_payload(results, market_state, et_now, total_tickers, clock_state=None):
     ranked = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
-    total_score = sum(r["adjusted_score"] for r in ranked) if ranked else 1
+    top = ranked[:MAX_PORTFOLIO_HOLDINGS]
+    total_score = sum(r["adjusted_score"] for r in top) if top else 1
+    n_passing = len(ranked)
+    n_holding = len(top)
 
     lines = []
     lines.append("**Glassbox Finance - MASTER EXECUTION REPORT**")
@@ -416,14 +454,15 @@ def build_master_payload(results, market_state, et_now, total_tickers, clock_sta
         lines.append(f"Status: {market_state} — Clock: {clock_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
     else:
         lines.append(f"Status: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
-    lines.append(f"Capital: ${STARTING_CAPITAL:,}  |  Universe: {total_tickers} tickers")
+    lines.append(f"Scanner: {WATCHLIST_SCANNER_LIMIT} tickers | Passed: {n_passing} | Funded: {n_holding}")
+    lines.append(f"Capital: ${STARTING_CAPITAL:,}")
     lines.append("")
     lines.append("```")
     header = f"{'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'$ Amt':>12} {'Shares':>8}"
     lines.append(header)
     lines.append("-" * len(header))
 
-    for r in ranked:
+    for r in top:
         score = r["adjusted_score"]
         pct = score / total_score * 100
         dollar_alloc = STARTING_CAPITAL * (pct / 100)
@@ -508,20 +547,24 @@ def sentiment_gate(stock, ticker, news_cache):
     try:
         news_raw = stock.news
     except Exception:
-        rolling_sent, rolling_pos, rolling_neg, count = compute_rolling_sentiment(entries, ticker)
+        short_sent, short_pos, short_neg, short_count = compute_rolling_sentiment(entries, ticker)
+        long_sent, long_pos, long_neg, long_count = compute_rolling_sentiment(entries, ticker, window_hours=LONG_WINDOW_HOURS)
+        blended = (1 - LONG_SENTIMENT_WEIGHT) * short_sent + LONG_SENTIMENT_WEIGHT * long_sent
         penalty = 1.0
-        if rolling_sent < 0.0:
-            penalty = 1.0 + (rolling_sent * 0.3)
+        if blended < 0.0:
+            penalty = 1.0 + (blended * 0.3)
             penalty = max(0.70, penalty)
-        return rolling_sent, penalty, [], rolling_pos, rolling_neg, count
+        return short_sent, penalty, [], short_pos, short_neg, short_count, long_sent, long_pos, long_neg, long_count
 
     if not news_raw:
-        rolling_sent, rolling_pos, rolling_neg, count = compute_rolling_sentiment(entries, ticker)
+        short_sent, short_pos, short_neg, short_count = compute_rolling_sentiment(entries, ticker)
+        long_sent, long_pos, long_neg, long_count = compute_rolling_sentiment(entries, ticker, window_hours=LONG_WINDOW_HOURS)
+        blended = (1 - LONG_SENTIMENT_WEIGHT) * short_sent + LONG_SENTIMENT_WEIGHT * long_sent
         penalty = 1.0
-        if rolling_sent < 0.0:
-            penalty = 1.0 + (rolling_sent * 0.3)
+        if blended < 0.0:
+            penalty = 1.0 + (blended * 0.3)
             penalty = max(0.70, penalty)
-        return rolling_sent, penalty, [], rolling_pos, rolling_neg, count
+        return short_sent, penalty, [], short_pos, short_neg, short_count, long_sent, long_pos, long_neg, long_count
 
     latest_headlines = []
     new_count = 0
@@ -557,16 +600,18 @@ def sentiment_gate(stock, ticker, news_cache):
         })
         new_count += 1
 
-    rolling_sent, rolling_pos, rolling_neg, count = compute_rolling_sentiment(entries, ticker)
+    short_sent, short_pos, short_neg, short_count = compute_rolling_sentiment(entries, ticker)
+    long_sent, long_pos, long_neg, long_count = compute_rolling_sentiment(entries, ticker, window_hours=LONG_WINDOW_HOURS)
+    blended = (1 - LONG_SENTIMENT_WEIGHT) * short_sent + LONG_SENTIMENT_WEIGHT * long_sent
     penalty = 1.0
-    if rolling_sent < 0.0:
-        penalty = 1.0 + (rolling_sent * 0.3)
+    if blended < 0.0:
+        penalty = 1.0 + (blended * 0.3)
         penalty = max(0.70, penalty)
 
     if new_count > 0:
-        print(f"  [{ticker}] Cached {new_count} new headline(s) | Rolling window: {count} unique articles | Sentiment: {rolling_sent:+.3f}")
+        print(f"  [{ticker}] Cached {new_count} new headline(s) | Short: {short_sent:+.3f} | 7d: {long_sent:+.3f} | Blended: {blended:+.3f}")
 
-    return rolling_sent, penalty, latest_headlines, rolling_pos, rolling_neg, count
+    return short_sent, penalty, latest_headlines, short_pos, short_neg, short_count, long_sent, long_pos, long_neg, long_count
 
 
 def process_ticker(ticker, index, total, news_cache):
@@ -609,7 +654,7 @@ def process_ticker(ticker, index, total, news_cache):
         else:
             directive = f"[MOCK ACTION] Would PASS Solvency and BUY shares."
 
-    net_sentiment, penalty, headlines, rolling_pos, rolling_neg, rolling_count = sentiment_gate(stock, ticker, news_cache)
+    net_sentiment, penalty, headlines, rolling_pos, rolling_neg, rolling_count, long_sent, long_pos, long_neg, long_count = sentiment_gate(stock, ticker, news_cache)
 
     if solvency_ok and net_sentiment < 0.0:
         print(f"  [{index}/{total}] [Semantic Analysis]: Computational linguistics detect high rhetorical negative sentiment across public news sources, indicating structural headline risk that down-weights our core fundamental asset valuation.")
@@ -634,6 +679,10 @@ def process_ticker(ticker, index, total, news_cache):
         "rolling_pos": rolling_pos,
         "rolling_neg": rolling_neg,
         "rolling_count": rolling_count,
+        "long_sentiment": long_sent,
+        "long_rolling_pos": long_pos,
+        "long_rolling_neg": long_neg,
+        "long_rolling_count": long_count,
     }
 
 
@@ -643,20 +692,25 @@ def display_portfolio_table(results):
         print(f"  PORTFOLIO DASHBOARD")
         print(f"{'='*80}")
         print(f"  No tickers passed all gates. Portfolio is empty.")
+        print(f"  [Scanner] {WATCHLIST_SCANNER_LIMIT} tickers evaluated, 0 passed.")
         print(f"{'='*80}")
         return
 
     ranked = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
-    total_score = sum(r["adjusted_score"] for r in ranked)
+    top = ranked[:MAX_PORTFOLIO_HOLDINGS]
+    n_passing = len(ranked)
+    n_holding = len(top)
+    total_score = sum(r["adjusted_score"] for r in top)
 
     print(f"\n{'='*90}")
     print(f"  PORTFOLIO DASHBOARD — Allocation of ${STARTING_CAPITAL:,}")
+    print(f"  [Scanner] {WATCHLIST_SCANNER_LIMIT} evaluated | {n_passing} passed | Top {n_holding} funded")
     print(f"{'='*90}")
-    header = f"  {'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'Dollar Amt':>12} {'Shares':>8}"
+    header = f"  {'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'$ Amt':>12} {'Shares':>8}"
     print(header)
     print(f"  {'------':<8} {'----------------------':<22} {'----------':>10} {'----------':>10} {'-----------':>12} {'-------':>8}")
 
-    for r in ranked:
+    for r in top:
         ticker = r["ticker"]
         status = r["status"]
         sent = r["sentiment"]
@@ -697,9 +751,7 @@ def check_market_clock():
     is_market_hours = open_minutes <= current_time_minutes < close_minutes
     if is_weekday and is_market_hours:
         return "MARKET_OPEN", now
-    # TEMP OVERRIDE — force MARKET_OPEN for portfolio testing
-    return "MARKET_OPEN", now
-    # return "ANALYTICAL_OFF_HOURS", now
+    return "ANALYTICAL_OFF_HOURS", now
 
 
 def load_sandbox_ledger():
@@ -946,7 +998,7 @@ def main():
 
     print(f"\n{'='*80}")
     print(f"  GLASSBOX FINANCE — Twin-Clock Architecture")
-    print(f"  Mode: {RUN_MODE}  |  Universe: {len(TICKERS)} tickers")
+    print(f"  Mode: {RUN_MODE}  |  Watchlist: {WATCHLIST_SCANNER_LIMIT} tickers  |  Max Holdings: {MAX_PORTFOLIO_HOLDINGS}")
     print(f"{'='*80}")
 
     news_cache = load_news_cache()
@@ -976,8 +1028,9 @@ def main():
                         print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
                 save_news_cache(news_cache)
                 send_batched_news(news_alerts, et_now)
-                display_portfolio_table(passed_results)
-                send_master_report(passed_results, market_state, et_now, len(TICKERS))
+                clipped = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)[:MAX_PORTFOLIO_HOLDINGS]
+                display_portfolio_table(clipped)
+                send_master_report(clipped, market_state, et_now, len(TICKERS))
                 mark_daily_allocation()
                 print(f"  [Gate] Daily allocation executed and timestamped.")
             else:
@@ -1033,15 +1086,15 @@ def main():
                         print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
                 save_news_cache(news_cache)
                 send_batched_news(news_alerts, et_now)
-                ranked = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)
-                total_score = sum(r["adjusted_score"] for r in ranked) if ranked else 1
-                sandbox_execute(ranked, total_score)
+                clipped = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)[:MAX_PORTFOLIO_HOLDINGS]
+                total_score = sum(r["adjusted_score"] for r in clipped) if clipped else 1
+                sandbox_execute(clipped, total_score)
                 mark_daily_allocation()
                 obs_state["clock_state"] = "LOCKED"
                 obs_state["price_log"] = {}
                 save_observation_state(obs_state)
                 ledger = load_sandbox_ledger()
-                payload = build_master_payload(passed_results, market_state, et_now, len(TICKERS), clock_state="LOCKED")
+                payload = build_master_payload(clipped, market_state, et_now, len(TICKERS), clock_state="LOCKED")
                 send_or_update_dashboard(payload, image_path="sandbox_performance.png")
             else:
                 ledger = visualization_update()

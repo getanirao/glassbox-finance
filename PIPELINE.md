@@ -4,18 +4,56 @@
 
 ---
 
-### Entry 11 — 2026-07-10T21:40:00Z
+### Entry 12 — 2026-07-10T22:05:00Z
 
-**Action:** Replaced 10 individual per-ticker `send_news_flash()` calls with a unified batched `send_batched_news()` roundup message.
+**Action:** Aligned `compute_rolling_sentiment()` window with adaptive weekend cache horizon.
 
 **Changes:**
-- Added `NEWS_MESSAGE_STATE_FILE = ".news_message_state"` constant
-- Added `load_news_message_state()` / `save_news_message_state()` helpers for roundup message ID persistence
-- Implemented `summarize_news_entry()` — scans each ticker's incoming headlines, selects the one with highest absolute net sentiment via lexicon scoring, truncates at a clean word boundary near 130 chars, returns formatted row: `TICKER [+X.XX] (X P / Y N) -> Truncated headline…`
-- Implemented `build_news_roundup()` — compiles all 10 rows into a single markdown card with `====` borders, timestamp, and 24h window status
-- Implemented `send_batched_news()` — transmits roundup via Discord webhook (POST on first cycle with `?wait=true`, saves ID to `.news_message_state`; PATCH on subsequent cycles to edit in-place)
-- Updated `handle_reset()` — reads `.news_message_state`, fires HTTP DELETE to purge the historical roundup card, deletes the tracker file; prints `.news_message_state` status in the reset banner
-- Replaced `for r in news_alerts: send_news_flash(r)` in both COMPETITION and SANDBOX OBSERVING branches with single `send_batched_news(news_alerts, et_now)` call after the 10-ticker loop
-- Kept `send_news_flash()` defined but no longer called from `main()`
+- Extracted weekday-based window logic into shared `get_cache_window_hours()` helper (Tue–Fri → 24, Sat–Mon → 72)
+- `prune_news_cache()` now calls `get_cache_window_hours()` instead of inline weekday check
+- `compute_rolling_sentiment()` now calls `get_cache_window_hours()` instead of the static `ROLLING_WINDOW_HOURS` constant
+- Removed unused `ROLLING_WINDOW_HOURS = 24` constant
+
+**Logical Integration:** Rolling sentiment averages now respect the same adaptive 72-hour window as the news cache on Sat–Mon, ensuring Friday afternoon and weekend headlines are factored into Monday morning's sentiment scores.
+
+**Files Touched:** `main.py`, `PIPELINE.md`
+
+---
+
+### Entry 13 — 2026-07-10T22:15:00Z
+
+**Action:** Added dual-window rolling sentiment architecture — short-term (adaptive 24/72h) blended with long-term (168h / 7 days).
+
+**Changes:**
+- Added constants `LONG_WINDOW_HOURS = 168` and `LONG_SENTIMENT_WEIGHT = 0.3`
+- `compute_rolling_sentiment()` accepts optional `window_hours` parameter (defaults to `get_cache_window_hours()` if None)
+- `sentiment_gate()` now computes both short-term and long-term rolling sentiment, blends them for penalty calculation: `blended = 0.7 × short + 0.3 × long`
+- Return value expanded from 6 to 10 fields (adds `long_sent`, `long_pos`, `long_neg`, `long_count`)
+- `process_ticker()` unpacks all 10 fields and stores long metrics in result dict under `long_sentiment`, `long_rolling_pos`, `long_rolling_neg`, `long_rolling_count`
+- `summarize_news_entry()` accepts optional `long_sent` param; dual format: `TICKER [short / long] (X P / Y N) -> headline`
+- `build_news_roundup()` passes `r.get("long_sentiment")` to `summarize_news_entry()`
+- Console print updated to show short, 7d, and blended scores during news caching
+
+**Files Touched:** `main.py`, `README.md`, `PIPELINE.md`
+
+---
+
+### Entry 14 — 2026-07-10T22:30:00Z
+
+**Action:** Deployed 75-ticker watchlist scanner with top-12 portfolio concentration filter and under-subscription safeguard.
+
+**Changes:**
+- Added constants `WATCHLIST_SCANNER_LIMIT = 75` and `MAX_PORTFOLIO_HOLDINGS = 12`
+- Replaced static 10-ticker universe with a 75-ticker broad-market array across 7 sectors: Technology (14), Healthcare (12), Energy (10), Consumer Cyclical (12), Industrials (12), Utilities (10), Finance (5)
+- Expanded `INSTITUTIONAL_BANKS` to `{"JPM", "GS", "BAC", "MS", "C"}` for bank exemption guards
+- `display_portfolio_table()` now clips ranked results to top `MAX_PORTFOLIO_HOLDINGS` and displays scanner telemetry (75 evaluated, N passed, top M funded)
+- `build_master_payload()` same clipping; shows "Scanner: 75 tickers | Passed: N | Funded: M"
+- `build_sandbox_status()` shows `Scanner: 75 tickers | Holdings: X / 12`
+- `build_news_roundup()` header shows scanner count and timestamp inline
+- `main()` COMPETITION branch clips `passed_results` to top `MAX_PORTFOLIO_HOLDINGS` before display and report
+- `main()` SANDBOX OBSERVING branch same clipping before `sandbox_execute` and dashboard
+- Under-subscription safeguard: capital denominator uses `min(MAX_PORTFOLIO_HOLDINGS, len(passing))` via slicing
+- Rate-limit protection preserved: `process_ticker` (accounting + news) only runs on 24h cycle, not 1-min visualization loop
+- Banner updated: `Mode: SANDBOX | Watchlist: 75 tickers | Max Holdings: 12`
 
 **Files Touched:** `main.py`, `README.md`, `PIPELINE.md`

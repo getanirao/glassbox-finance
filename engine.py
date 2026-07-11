@@ -363,14 +363,18 @@ def send_batched_news(alerts, et_now):
         if existing_id:
             edit_url = f"https://discord.com/api/webhooks/{wh_id}/{wh_token}/messages/{existing_id}"
             resp = requests.patch(edit_url, json={"content": payload}, timeout=15)
+            resp.raise_for_status()
+            print(f"\n  [News Roundup] Edited message ID [{existing_id}] ({len(alerts)} tickers).")
         else:
             post_url = webhook_url.rstrip("/") + "?wait=true"
             resp = requests.post(post_url, json={"content": payload}, timeout=15)
+            resp.raise_for_status()
             msg_id = resp.json().get("id")
             if msg_id:
                 save_news_message_state(msg_id)
-        resp.raise_for_status()
-        print(f"\n  [News Roundup] Transmitted ({len(alerts)} tickers).")
+                print(f"\n  [News Roundup] Posted new message ID [{msg_id}] ({len(alerts)} tickers).")
+            else:
+                print(f"\n  [News Roundup] Posted but no message ID returned.")
     except Exception as e:
         print(f"\n  [News Roundup] Transmission failed - {e}.")
         try:
@@ -379,6 +383,12 @@ def send_batched_news(alerts, et_now):
                 print(f"  [News Roundup] Response: {resp_text}")
         except Exception:
             pass
+        if existing_id:
+            print(f"  [News Roundup] PATCH failed — clearing stale message ID.")
+            try:
+                os.remove(NEWS_MESSAGE_STATE_FILE)
+            except Exception:
+                pass
 
 
 # ── news flash ────────────────────────────────────────────────────────────

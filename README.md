@@ -16,10 +16,10 @@ Quantitative finance engine that transforms blackbox buy/sell signals into audit
 - **NYSE Market Clock Gate Active** — Detects US Eastern Time and only displays the full trade execution dashboard during regular market hours (9:30 AM–4:00 PM ET, Mon–Fri). Off-hours runs still compute all analytics but output a summary report instead of executable allocation orders.
 - **Automated Team Desk Notifications Online** — Every valid MARKET_OPEN run transmits a formatted portfolio report to a Discord/Slack webhook loaded securely from the `.env` file. Off-hours runs suppress the alert.
 - **Dual-Mode Operating System Active** — Select mode at launch with `python main.py --comp` (manual routing table + webhook alerts) or `python main.py --sandbox` (auto-execution with persistent portfolio ledger, real-time matplotlib charting, and twin-clock architecture). Both modes enforce the 24-hour cooldown and NYSE market clock. Running with no arguments defaults to COMPETITION.
-- **Continuous News Streaming Framework Online** — Engine runs an infinite 60-minute loop across the full 75-ticker watchlist. Every cycle fetches live data, evaluates solvency, scans news sentiment, and compiles all tickers into a single batched **News Roundup** message on Discord. The roundup is posted fresh on the first cycle and PATCH-edited in-place on subsequent cycles, eliminating notification spam. The 24-hour allocation gate is detached from news — capital distribution fires only when NYSE is open AND 24h cooldown has expired.
+- **Continuous 60-Minute News Stream Active** — A dedicated news clock runs independently of market hours, scraping headlines for all 75 tickers every 60 minutes. Between ticker fetches, calls are jittered with 1.5–3.5s random sleep to avoid Yahoo Finance rate limits. A file-based lock (`.news_lock`) prevents race conditions between the news stream and the 24-hour decision clock. Each stream cycle compiles a single batched **News Roundup** Discord message (POST on first, PATCH on subsequent). The 24-hour decision clock reads sentiment exclusively from `.news_cache.json` — never calling `stock.news` — eliminating redundant API traffic.
 - **Deduplicated Rolling News Cache Active** — A persistent `.news_cache.json` stores every unique headline with per-article sentiment scores. Duplicate headlines across 60-minute cycles are silently skipped.
-- **Dual-Window Rolling Sentiment Architecture Online** — Two independent sentiment horizons govern each ticker's penalty multiplier. The **short-term** score uses an adaptive window (24h weekdays / 72h Sat–Mon) for reactive headline response. The **long-term** score uses a fixed 168-hour (7-day) window as a trend anchor. The blended penalty (`0.7 × short + 0.3 × long`) smooths noise while preserving real-time market sensitivity. The news roundup displays both scores side-by-side.
-- **Adaptive Weekend Cache Horizon Online** — The `prune_news_cache()` gate automatically adjusts its expiration window based on the UTC weekday. Tuesday through Friday uses a strict 24-hour cache window. Saturday through Monday dynamically extends to 72 hours, preserving Friday afternoon and weekend corporate news for Monday morning's rolling sentiment averages.
+- **Decay-Weighted Rolling Sentiment Architecture Online** — Two independent sentiment horizons govern each ticker's penalty multiplier. The **short-term** score uses an adaptive window (24h Tue–Thu / 72h Fri–Mon) for reactive headline response. The **long-term** score uses a fixed 168-hour (7-day) window as a trend anchor. Both windows apply **exponential decay weighting** with a 72-hour half-life (`weight = 0.5^(age_hours / 72)`), so newer headlines contribute more than older ones within each window. The blended penalty (`0.7 × short + 0.3 × long`) smooths noise while preserving real-time market sensitivity. The news roundup displays both scores side-by-side.
+- **Adaptive Weekend Cache Horizon Online** — The `prune_news_cache()` gate automatically adjusts its expiration window based on the UTC weekday. Tuesday through Thursday uses a strict 24-hour cache window. Friday through Monday dynamically extends to 72 hours, preserving Friday afternoon and weekend corporate news for Monday morning's rolling sentiment averages.
 - **Twin-Clock Architecture Active** — Two independent clocks govern the engine. The **24-Hour Decision Clock** restricts core portfolio re-allocations (solvency checks, sentiment re-parsing, holdings changes) to once per day in both COMPETITION and SANDBOX modes. The **1-Minute Visualization Clock** in SANDBOX mode runs continuous 60-second cycles that pull only current spot prices, calculate live net worth, update the portfolio history ledger, and re-plot the matplotlib performance chart — without ever changing holdings.
 - **Smart Execution Trigger Online** — When the 24-hour decision gate expires, the engine enters an **Observation State** instead of immediately executing. It monitors the 5-minute rolling volatility spread across the full 75-ticker watchlist. The daily rebalance fires only when volatility drops below a 0.5% threshold or after a 30-minute market-open grace period, protecting against intra-day whipsaw risk. A distinct `[Smart Trigger]` console log marks the execution.
 - **Self-Editing Discord Dashboard Active** — The dashboard displays the live clock state (`LOCKED`, `OBSERVING INTRA-DAY VOLATILITY`, or `UPDATING REAL-TIME VALUE`) alongside the changing line chart. The first cycle POSTs a new message; all subsequent 1-minute cycles PATCH the same message in-place with updated text and chart attachment. Historical chart stacking is prevented by injecting an explicit empty `attachments` array into the `payload_json` envelope before each PATCH, ensuring Discord removes the prior image before uploading the new one.
@@ -65,10 +65,20 @@ python main.py
 | **`--comp`** | COMPETITION | Enforces strict 24-hour time locks and NYSE hour boundaries. Outputs text-only integer share ledgers designed for manual tournament order entries. |
 | **`--sandbox`** | SANDBOX | Accelerates the execution loop to a high-speed 1-minute cadence during market open hours. Automates virtual data collection, generates `matplotlib` visual trend charts, and streams live graphical updates. |
 | **`--clear`** | — | Purges all local state (`.last_run`, `.news_cache.json`, `.observation_state`, `.message_state`), deletes the active Discord dashboard message, and resets PIPELINE.md log entries. |
+| **`--bot`** | Both | Starts Discord bot alongside engine with slash commands. |
+| **`--bot-only`** | — | Starts only the Discord bot without the engine. Requires `BOT_TOKEN` env. |
 | *(none)* | COMPETITION | Default mode. Prints a usage notice then runs as COMPETITION. |
 
+### Docker Commands
+| Command | Description |
+| :--- | :--- |
+| `docker compose up -d` | Build and start container in background |
+| `docker compose logs -f` | Follow engine + bot logs |
+| `docker compose down` | Stop container gracefully |
+| `docker compose exec glassbox python main.py --clear` | Reset state from inside container |
+
 ### Global Configuration Constants
-*Located at the top of `main.py` for framework calibration.*
+*Located in `config.py` for framework calibration.*
 
 | Constant | Default | Purpose |
 | :--- | :--- | :--- |
@@ -81,6 +91,10 @@ python main.py
 | **`MAX_PORTFOLIO_HOLDINGS`** | `12` | Maximum funded portfolio positions per allocation cycle. |
 | **`LONG_WINDOW_HOURS`** | `168` | Long-term sentiment trend anchor window (7 days). |
 | **`LONG_SENTIMENT_WEIGHT`** | `0.3` | Blending weight for long-term sentiment in penalty calculation. |
+| **`NEWS_CYCLE_HOURS`** | `1` | Frequency of the continuous news stream (hours). |
+| **`NEWS_RATE_MIN`** | `1.5` | Minimum jitter sleep (seconds) between ticker fetches in the news stream. |
+| **`NEWS_RATE_MAX`** | `3.5` | Maximum jitter sleep (seconds) between ticker fetches in the news stream. |
+| **`DECAY_HALF_LIFE_HOURS`** | `72` | Half-life for exponential sentiment decay weighting (3 trading days). |
 
 ### Automated Time-Series Status Flags
 *Dynamically calculated by the engine's internal clock layers.*
@@ -88,12 +102,56 @@ python main.py
 - **`MARKET_OPEN`**: Active during regular NYSE trading hours (9:30 AM – 4:00 PM Eastern, Monday through Friday). Unlocks full portfolio allocation ledgers and transaction share routing tables.
 - **`ANALYTICAL_OFF_HOURS`**: Active outside regular market hours and weekends. Enforces an asset allocation lock to protect capital from extended-hours liquidity traps, shifting the engine into a continuous data and text sentiment screening stream.
 
-### Twin-Clock Observation State Machine
+### Three-Clock Architecture
+
+Three independent clocks govern the engine in a single-threaded pipeline. The **60-Minute News Stream** scrapes Yahoo Finance headlines for all 75 tickers every hour (24/7/365), independently of market hours, with jittered rate limiting between requests. The **24-Hour Decision Clock** restricts core portfolio re-allocations (solvency checks, sentiment re-parsing, holdings changes) to once per day in both COMPETITION and SANDBOX modes. The **1-Minute Visualization Clock** in SANDBOX mode runs continuous 60-second cycles that pull only current spot prices, calculate live net worth, update the portfolio history ledger, and re-plot the matplotlib performance chart — without ever changing holdings.
+
+#### Observation State Machine
 *Persisted in `.observation_state` and displayed on the live Discord dashboard.*
 
 - **`LOCKED`**: 24-hour decision gate is active. Rebalance completed. Visualization-only 1-minute cycles update net worth and chart without changing holdings.
 - **`OBSERVING INTRA-DAY VOLATILITY`**: 24-hour gate has expired. Engine is collecting 1-minute spot prices and monitoring the 5-minute rolling volatility spread across all tickers. No trades execute until the spread drops below 0.5% or the 30-minute market-open grace period elapses.
 - **`UPDATING REAL-TIME VALUE`**: Post-rebalance state. Holdings are locked for 24 hours. Dashboard refreshes every 60 seconds with current spot prices, portfolio net worth, and the updated performance chart.
+
+### Discord Bot (Slash Commands)
+
+The engine can run alongside a Discord application bot that responds to slash commands in your server.
+
+| Command | Description |
+| :--- | :--- |
+| `/status` | Engine mode, clock state, portfolio value, last run |
+| `/holdings` | Current portfolio positions with live prices |
+| `/news` | News cache summary with short + 7d sentiment |
+| `/history` | Last 20 portfolio value entries with change |
+| `/chart` | Latest `sandbox_performance.png` |
+| `/help` | Command list |
+| `/pause` | Pause the engine loop |
+| `/resume` | Resume the engine loop |
+| `/stop` | Gracefully stop engine (preserves cache) |
+| `/clear` | Clear news cache and state files |
+| `/run_sandbox` | Trigger immediate SANDBOX evaluation cycle |
+| `/run_comp` | Trigger immediate COMPETITION evaluation cycle |
+
+Role-checking is disabled — all commands available to everyone.
+
+### Docker Deployment
+
+```bash
+# Set secrets
+export BOT_TOKEN="your_discord_bot_token"
+export WEBHOOK_URL="https://discord.com/api/webhooks/..."
+
+# Build and start
+docker compose up -d
+
+# View logs
+docker compose logs -f --tail 100
+
+# Stop
+docker compose down
+```
+
+Configuration via `docker-compose.yml`: 512MB memory limit, named volume `glassbox_data` for persistent state, auto-restart on failure.
 
 ## Features Implemented
 

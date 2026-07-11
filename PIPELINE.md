@@ -4,56 +4,38 @@
 
 ---
 
-### Entry 12 — 2026-07-10T22:05:00Z
+### Entry 17 — 2026-07-10T23:45:00Z
 
-**Action:** Aligned `compute_rolling_sentiment()` window with adaptive weekend cache horizon.
-
-**Changes:**
-- Extracted weekday-based window logic into shared `get_cache_window_hours()` helper (Tue–Fri → 24, Sat–Mon → 72)
-- `prune_news_cache()` now calls `get_cache_window_hours()` instead of inline weekday check
-- `compute_rolling_sentiment()` now calls `get_cache_window_hours()` instead of the static `ROLLING_WINDOW_HOURS` constant
-- Removed unused `ROLLING_WINDOW_HOURS = 24` constant
-
-**Logical Integration:** Rolling sentiment averages now respect the same adaptive 72-hour window as the news cache on Sat–Mon, ensuring Friday afternoon and weekend headlines are factored into Monday morning's sentiment scores.
-
-**Files Touched:** `main.py`, `PIPELINE.md`
-
----
-
-### Entry 13 — 2026-07-10T22:15:00Z
-
-**Action:** Added dual-window rolling sentiment architecture — short-term (adaptive 24/72h) blended with long-term (168h / 7 days).
+**Action:** Exponential decay weighting for rolling sentiment + Friday 72h window correction.
 
 **Changes:**
-- Added constants `LONG_WINDOW_HOURS = 168` and `LONG_SENTIMENT_WEIGHT = 0.3`
-- `compute_rolling_sentiment()` accepts optional `window_hours` parameter (defaults to `get_cache_window_hours()` if None)
-- `sentiment_gate()` now computes both short-term and long-term rolling sentiment, blends them for penalty calculation: `blended = 0.7 × short + 0.3 × long`
-- Return value expanded from 6 to 10 fields (adds `long_sent`, `long_pos`, `long_neg`, `long_count`)
-- `process_ticker()` unpacks all 10 fields and stores long metrics in result dict under `long_sentiment`, `long_rolling_pos`, `long_rolling_neg`, `long_rolling_count`
-- `summarize_news_entry()` accepts optional `long_sent` param; dual format: `TICKER [short / long] (X P / Y N) -> headline`
-- `build_news_roundup()` passes `r.get("long_sentiment")` to `summarize_news_entry()`
-- Console print updated to show short, 7d, and blended scores during news caching
+- Changed `get_cache_window_hours()` weekday logic: Tue–Thu → 24h, Fri–Mon → 72h (was Tue–Fri 24h, which left Friday's news stale by Monday)
+- Added `DECAY_HALF_LIFE_HOURS = 72` to `config.py` (3-trading-day half-life, based on ARIA Analyst empirical research)
+- Rewrote `compute_rolling_sentiment()` to apply exponential decay weighting inside every window: `weight = 0.5^(age_hours / 72)`. Sentiment is now a weighted average; pos/neg counts are rounded weighted sums.
+- All command responses changed from `ephemeral=True` to `ephemeral=False` (visible to everyone in channel), except error/empty-state messages.
 
-**Files Touched:** `main.py`, `README.md`, `PIPELINE.md`
+**Research Basis:** ARIA Analyst (2026) found 3-trading-day half-life is the empirical sweet spot for equity headline sentiment. RavenPack research confirms sentiment alpha dissipates over 2–5 day horizon. Stockholm University thesis showed decay-weighted signals consistently outperform flat-window aggregation.
 
----
+**Files Touched:** `config.py`, `engine.py`, `bot.py`, `PIPELINE.md`, `README.md`
 
-### Entry 14 — 2026-07-10T22:30:00Z
+### Entry 16 — 2026-07-10T23:30:00Z
 
-**Action:** Deployed 75-ticker watchlist scanner with top-12 portfolio concentration filter and under-subscription safeguard.
+**Action:** Full containerization and Discord bot integration — refactored into modular architecture with slash commands, role-based access control, async engine runner, Docker deployment, and persistent `data/` volume.
 
 **Changes:**
-- Added constants `WATCHLIST_SCANNER_LIMIT = 75` and `MAX_PORTFOLIO_HOLDINGS = 12`
-- Replaced static 10-ticker universe with a 75-ticker broad-market array across 7 sectors: Technology (14), Healthcare (12), Energy (10), Consumer Cyclical (12), Industrials (12), Utilities (10), Finance (5)
-- Expanded `INSTITUTIONAL_BANKS` to `{"JPM", "GS", "BAC", "MS", "C"}` for bank exemption guards
-- `display_portfolio_table()` now clips ranked results to top `MAX_PORTFOLIO_HOLDINGS` and displays scanner telemetry (75 evaluated, N passed, top M funded)
-- `build_master_payload()` same clipping; shows "Scanner: 75 tickers | Passed: N | Funded: M"
-- `build_sandbox_status()` shows `Scanner: 75 tickers | Holdings: X / 12`
-- `build_news_roundup()` header shows scanner count and timestamp inline
-- `main()` COMPETITION branch clips `passed_results` to top `MAX_PORTFOLIO_HOLDINGS` before display and report
-- `main()` SANDBOX OBSERVING branch same clipping before `sandbox_execute` and dashboard
-- Under-subscription safeguard: capital denominator uses `min(MAX_PORTFOLIO_HOLDINGS, len(passing))` via slicing
-- Rate-limit protection preserved: `process_ticker` (accounting + news) only runs on 24h cycle, not 1-min visualization loop
-- Banner updated: `Mode: SANDBOX | Watchlist: 75 tickers | Max Holdings: 12`
+- Created `config.py` — extracted all constants (paths, lexicons, ticker array, Discord roles) into a shared module
+- Created `engine.py` — migrated all engine functions (sentiment, solvency, news stream, sandbox, visualization) with `data/` path prefix; added `EngineRunner` class wrapping the main loop with `threading.Event`-based pause/resume/stop controls and thread-safe status dict
+- Created `bot.py` — Discord bot with `discord.py` 2.7+ `app_commands` slash commands across three cogs:
+  - `EngineCog`: `/status`, `/pause`, `/resume`, `/reset` (admin-gated)
+  - `QueryCog`: `/holdings`, `/news`, `/history`, `/chart`, `/help` (trader-gated)
+  - Role-based checks via `admin_check()` and `trader_check()` against configured role names `Admin` and `Trader`
+- Rewrote `main.py` — thin entry point with `--bot` and `--bot-only` flags, `ensure_data_dir()`, engine thread launch, async bot startup
+- Created `Dockerfile` — `python:3.13-slim`, system fonts for matplotlib, `data/` volume, Agg backend, `PYTHONUNBUFFERED=1`
+- Created `docker-compose.yml` — `mem_limit: 512m`, `mem_reservation: 256m`, named volume `glassbox_data`, 30s graceful stop, json-file logging capped at 10MB × 3
+- Created `requirements.txt` — yfinance, pandas, matplotlib, requests, python-dotenv, discord.py
+- Created `.dockerignore` — excludes pycache, git, .env, data/, markdown docs
+- Updated `.gitignore` — added `data/`, `Dockerfile`, `docker-compose.yml`, `.dockerignore`
 
-**Files Touched:** `main.py`, `README.md`, `PIPELINE.md`
+**Logical Integration:** The repository now ships as a containerized application deployable with `docker compose up -d`. The `EngineRunner` runs the three-clock loop in a background daemon thread while the Discord bot handles slash commands on the main async event loop, with thread-safe status queries via a locked dict. Persistent state lives in a Docker named volume at `/app/data`. Memory is capped at 512MB. The bot supports two access tiers: `Trader` (read-only queries) and `Admin` (pause/resume/reset).
+
+**Files Touched:** `config.py`, `engine.py`, `bot.py`, `main.py`, `Dockerfile`, `docker-compose.yml`, `requirements.txt`, `.dockerignore`, `.gitignore`, `PIPELINE.md`

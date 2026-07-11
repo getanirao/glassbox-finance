@@ -10,6 +10,14 @@ sandbox_performance.png
 .news_message_state
 .news_cache.json
 
+# Data directory (Docker persistent volume)
+data/
+
+# Docker
+Dockerfile
+docker-compose.yml
+.dockerignore
+
 # Python
 __pycache__/
 *.pyc

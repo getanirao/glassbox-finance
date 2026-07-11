@@ -1039,6 +1039,7 @@ class EngineRunner:
         print(f"{'='*80}")
 
         news_cache = load_news_cache()
+        release_news_lock()
 
         while not self._stopped.is_set():
             self._paused.wait()

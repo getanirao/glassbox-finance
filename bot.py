@@ -198,15 +198,18 @@ class QueryCog(commands.Cog):
         for h in entries:
             t = h.get("ticker", "?")
             ticker_counts[t] = ticker_counts.get(t, 0) + 1
-        top = sorted(ticker_counts.items(), key=lambda x: -x[1])[:20]
+        scored = []
+        for t, cnt in ticker_counts.items():
+            ss, sp, sn, sc = compute_rolling_sentiment(entries, t)
+            ls, lp, ln, lc = compute_rolling_sentiment(entries, t, window_hours=LONG_WINDOW_HOURS)
+            scored.append((t, cnt, ss, ls))
+        top = sorted(scored, key=lambda x: x[2], reverse=True)[:20]
         lines = [f"**News Cache Summary**  |  {len(entries)} total headlines"]
-        lines.append(f"Top tickers by headline count:")
+        lines.append(f"Top tickers by short-term sentiment:")
         lines.append("```")
         lines.append(f"{'Ticker':<8} {'Headlines':>10} {'Short Sent':>12} {'7d Sent':>10}")
         lines.append("-" * 42)
-        for t, cnt in top:
-            ss, sp, sn, sc = compute_rolling_sentiment(entries, t)
-            ls, lp, ln, lc = compute_rolling_sentiment(entries, t, window_hours=LONG_WINDOW_HOURS)
+        for t, cnt, ss, ls in top:
             lines.append(f"{t:<8} {cnt:>10} {ss:>+11.3f} {ls:>+9.3f}")
         lines.append("```")
         await interaction.response.send_message("\n".join(lines), ephemeral=False)

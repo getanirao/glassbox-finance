@@ -8,6 +8,7 @@ LOOP_INTERVAL_MINUTES = 60
 VOLATILITY_THRESHOLD = 0.005
 VOLATILITY_WINDOW = 5
 GRACE_MINUTES = 30
+WARMUP_MINUTES = 10
 LONG_WINDOW_HOURS = 168
 LONG_SENTIMENT_WEIGHT = 0.3
 DECAY_HALF_LIFE_HOURS = 72
@@ -24,6 +25,7 @@ NEWS_MESSAGE_STATE_FILE = os.path.join(DATA_DIR, ".news_message_state")
 OBSERVATION_FILE = os.path.join(DATA_DIR, ".observation_state")
 NEWS_CYCLE_FILE = os.path.join(DATA_DIR, ".last_news_run")
 NEWS_LOCK_FILE = os.path.join(DATA_DIR, ".news_lock")
+RUN_MODE_FILE = os.path.join(DATA_DIR, ".run_mode")
 SANDBOX_LEDGER = os.path.join(DATA_DIR, "sandbox_history.json")
 SANDBOX_CHART = os.path.join(DATA_DIR, "sandbox_performance.png")
 

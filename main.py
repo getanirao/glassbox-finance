@@ -48,7 +48,15 @@ def main():
         print("  Error: --sandbox and --comp are mutually exclusive.")
         sys.exit(1)
 
-    run_mode = "SANDBOX" if args.sandbox else "COMPETITION"
+    from config import RUN_MODE_FILE
+    if args.sandbox:
+        run_mode = "SANDBOX"
+    elif args.comp:
+        run_mode = "COMPETITION"
+    elif os.path.exists(RUN_MODE_FILE):
+        run_mode = open(RUN_MODE_FILE).read().strip()
+    else:
+        run_mode = os.environ.get("RUN_MODE", "COMPETITION")
 
     if not args.sandbox and not args.comp and not args.bot and not args.bot_only:
         print("\n  Glassbox Finance — Wolves of Wall Street")

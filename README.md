@@ -13,16 +13,16 @@ Quantitative finance engine that transforms blackbox buy/sell signals into audit
 - **Manual System Reset Gate Available** — Running `python main.py --clear` wipes the time cooldown gate, clears the news cache, resets the observation state, purges the active Discord dashboard message from channel history, deletes the local message state tracker, and resets PIPELINE.md log entries while preserving the header and archive pointer, enabling a clean epoch restart.
 - **Ternary Trading Signals (Buy / Hold / Sell) Active** — Each rebalance cycle executes a three-phase portfolio sweep: **SELL** exits held positions that fail solvency or drop out of the top 12 (freeing cash, recording realized P&L), **HOLD** keeps qualifying existing positions untouched, and **BUY** allocates remaining cash proportionally by adjusted_score to new tickers only. Prevents the leaky-bucket accumulation pattern and enables realistic competition portfolio management.
 - **Semantic Analysis Engine Active** — Every solvency or sentiment rejection now includes a human-readable [Semantic Analysis] justification explaining the first-principles financial reasoning behind the mathematical gate decision.
-- **NYSE Market Clock Gate Active** — Detects US Eastern Time and only displays the full trade execution dashboard during regular market hours (9:30 AM–4:00 PM ET, Mon–Fri). Off-hours runs still compute all analytics but output a summary report instead of executable allocation orders.
-- **Automated Team Desk Notifications Online** — Every valid MARKET_OPEN run transmits a formatted portfolio report to a Discord/Slack webhook loaded securely from the `.env` file. Off-hours runs suppress the alert.
+- **NYSE Market Clock Gate Active** — Detects US Eastern Time. In COMPETITION mode, it restricts executable allocation orders to regular market hours (9:30 AM–4:00 PM ET, Mon–Fri). In SANDBOX mode, it now **prevents simulated BUY/SELL/HOLD trades** during off-market hours, while still computing all analytics.
+- **Automated Team Desk Notifications Online** — News Roundups are now transmitted to Discord 24/7. Dashboard messages are updated dynamically, with robust error handling for stale message IDs, automatically posting new messages if needed. Portfolio reports for MARKET_OPEN runs are transmitted as before; off-hours runs suppress these specific alerts.
 - **Dual-Mode Operating System Active** — Select mode at launch with `python main.py --comp` (manual routing table + webhook alerts) or `python main.py --sandbox` (auto-execution with persistent portfolio ledger, real-time matplotlib charting, and twin-clock architecture). Both modes enforce the 24-hour cooldown and NYSE market clock. Running with no arguments defaults to COMPETITION.
-- **Continuous 60-Minute News Stream Active** — A dedicated news clock runs independently of market hours, scraping headlines for all 75 tickers every 60 minutes. Between ticker fetches, calls are jittered with 1.5–3.5s random sleep to avoid Yahoo Finance rate limits. A file-based lock (`.news_lock`) prevents race conditions between the news stream and the 24-hour decision clock. Each stream cycle compiles a single batched **News Roundup** Discord message (POST on first, PATCH on subsequent). The 24-hour decision clock reads sentiment exclusively from `.news_cache.json` — never calling `stock.news` — eliminating redundant API traffic.
+- **Continuous 60-Minute News Stream Active** — A dedicated news clock runs independently of market hours, scraping headlines for all 75 tickers every 60 minutes. Between ticker fetches, calls are jittered with 1.5–3.5s random sleep to avoid Yahoo Finance rate limits. A file-based lock (`.news_lock`) prevents race conditions between the news stream and the 24-hour decision clock. Each stream cycle compiles a single batched **News Roundup** Discord message (POST on first, PATCH on subsequent) with a `Last Fetched: HH:MM PT` freshness header. Payloads are hard-capped under Discord's 2000-char limit with suffix-aware truncation, and PATCH errors are differentiated — only HTTP 404 (genuinely deleted message) clears the message ID, preventing duplicate roundup messages on transient errors. The 24-hour decision clock reads sentiment exclusively from `.news_cache.json` — never calling `stock.news` — eliminating redundant API traffic.
 - **Deduplicated Rolling News Cache Active** — A persistent `.news_cache.json` stores every unique headline with per-article sentiment scores. Duplicate headlines across 60-minute cycles are silently skipped.
 - **Decay-Weighted Rolling Sentiment Architecture Online** — Two independent sentiment horizons govern each ticker's penalty multiplier. The **short-term** score uses an adaptive window (24h Tue–Thu / 72h Fri–Mon) for reactive headline response. The **long-term** score uses a fixed 168-hour (7-day) window as a trend anchor. Both windows apply **exponential decay weighting** with a 72-hour half-life (`weight = 0.5^(age_hours / 72)`), so newer headlines contribute more than older ones within each window. The blended penalty (`0.7 × short + 0.3 × long`) smooths noise while preserving real-time market sensitivity. The news roundup displays both scores side-by-side.
 - **Adaptive Weekend Cache Horizon Online** — The `prune_news_cache()` gate automatically adjusts its expiration window based on the UTC weekday. Tuesday through Thursday uses a strict 24-hour cache window. Friday through Monday dynamically extends to 72 hours, preserving Friday afternoon and weekend corporate news for Monday morning's rolling sentiment averages.
 - **Twin-Clock Architecture Active** — Two independent clocks govern the engine. The **24-Hour Decision Clock** restricts core portfolio re-allocations (solvency checks, sentiment re-parsing, holdings changes) to once per day in both COMPETITION and SANDBOX modes. The **1-Minute Visualization Clock** in SANDBOX mode runs continuous 60-second cycles that pull only current spot prices, calculate live net worth, update the portfolio history ledger, and re-plot the matplotlib performance chart — without ever changing holdings.
-- **Smart Execution Trigger Online** — When the 24-hour decision gate expires, the engine enters an **Observation State** instead of immediately executing. It monitors the 5-minute rolling volatility spread across the full 75-ticker watchlist. The daily rebalance fires only when volatility drops below a 0.5% threshold or after a 30-minute market-open grace period, protecting against intra-day whipsaw risk. A distinct `[Smart Trigger]` console log marks the execution.
-- **Self-Editing Discord Dashboard Active** — The dashboard displays the live clock state (`LOCKED`, `OBSERVING INTRA-DAY VOLATILITY`, or `UPDATING REAL-TIME VALUE`) alongside the changing line chart. The first cycle POSTs a new message; all subsequent 1-minute cycles PATCH the same message in-place with updated text and chart attachment. Historical chart stacking is prevented by injecting an explicit empty `attachments` array into the `payload_json` envelope before each PATCH, ensuring Discord removes the prior image before uploading the new one.
+- **Smart Execution Trigger Online** — When the 24-hour decision gate expires, the engine enters an **Observation State** instead of immediately executing. It monitors the 5-minute rolling volatility spread across the full 75-ticker watchlist. The daily rebalance fires only when volatility drops below a 0.5% threshold — but never within the first 10 minutes of market open (warm-up floor), and no later than 30 minutes (hard cap). This avoids the chaotic opening price-discovery window while still catching early stabilization. A distinct `[Smart Trigger]` console log marks the execution.
+- **Self-Editing Discord Dashboard Active** — The dashboard displays the live clock state (`LOCKED`, `OBSERVING INTRA-DAY VOLATILITY`, or `UPDATING REAL-TIME VALUE`) and the current **market state** (e.g., `MARKET_OPEN`, `ANALYTICAL_OFF_HOURS`) alongside the changing line chart. The first cycle POSTs a new message; all subsequent 1-minute cycles PATCH the same message in-place with updated text and chart attachment. Robust error handling is now in place for `404 Not Found` errors, clearing stale message IDs and automatically posting a new dashboard message if the old one is deleted from Discord. Historical chart stacking is prevented by injecting an explicit empty `attachments` array into the `payload_json` envelope before each PATCH, ensuring Discord removes the prior image before uploading the new one.
 - **Automated Discord Message Purge on Reset** — Running `python main.py --clear` sends HTTP DELETE requests to Discord to remove both the active dashboard message (from `.message_state`) and the news roundup message (from `.news_message_state`) from channel history before cleaning up local state. If a message was already deleted, logs a warning and continues without crashing.
 
 ## GlassBox Finance: Command Reference Index
@@ -38,7 +38,7 @@ python main.py --comp
 ```
 
 #### Sandbox Paper Trading
-Accelerates to a high-speed 1-minute visualization cadence during market open hours. Automates virtual data collection, generates matplotlib real-time performance charts, and streams live graphical dashboard updates.
+Accelerates to a high-speed 1-minute visualization cadence. Automates virtual data collection, generates matplotlib real-time performance charts, and streams live graphical dashboard updates. **Automated BUY/SELL/HOLD trades only occur during NYSE market open hours.**
 ```bash
 python main.py --sandbox
 ```
@@ -63,7 +63,7 @@ python main.py
 | Argument | Mode | Operational Outcome |
 | :--- | :--- | :--- |
 | **`--comp`** | COMPETITION | Enforces strict 24-hour time locks and NYSE hour boundaries. Outputs text-only integer share ledgers designed for manual tournament order entries. |
-| **`--sandbox`** | SANDBOX | Accelerates the execution loop to a high-speed 1-minute cadence during market open hours. Automates virtual data collection, generates `matplotlib` visual trend charts, and streams live graphical updates. |
+| **`--sandbox`** | SANDBOX | Accelerates the execution loop to a high-speed 1-minute cadence. Automates virtual data collection, generates `matplotlib` visual trend charts, and streams live graphical updates. **Automated BUY/SELL/HOLD trades only occur during NYSE market open hours.** |
 | **`--clear`** | — | Purges all local state (`.last_run`, `.news_cache.json`, `.observation_state`, `.message_state`), deletes the active Discord dashboard message, and resets PIPELINE.md log entries. |
 | **`--bot`** | Both | Starts Discord bot alongside engine with slash commands. |
 | **`--bot-only`** | — | Starts only the Discord bot without the engine. Requires `BOT_TOKEN` env. |
@@ -86,7 +86,8 @@ python main.py
 | **`GATE_HOURS`** | `24` | Cooldown period between daily allocation cycles. |
 | **`VOLATILITY_THRESHOLD`** | `0.005` | Maximum 5-minute rolling volatility spread (0.5%) for smart trigger execution. |
 | **`VOLATILITY_WINDOW`** | `5` | Number of 1-minute price samples used for rolling volatility computation. |
-| **`GRACE_MINUTES`** | `30` | Market-open grace period before forced execution regardless of volatility. |
+| **`GRACE_MINUTES`** | `30` | Market-open hard cap: forces execution after this many minutes regardless of volatility. |
+| **`WARMUP_MINUTES`** | `10` | Market-open warm-up floor: no execution allowed before this many minutes, regardless of how calm volatility appears. |
 | **`WATCHLIST_SCANNER_LIMIT`** | `75` | Number of equities in the broad-market watchlist universe. |
 | **`MAX_PORTFOLIO_HOLDINGS`** | `12` | Maximum funded portfolio positions per allocation cycle. |
 | **`LONG_WINDOW_HOURS`** | `168` | Long-term sentiment trend anchor window (7 days). |
@@ -141,6 +142,11 @@ Role-checking is disabled — all commands available to everyone.
 export BOT_TOKEN="your_discord_bot_token"
 export WEBHOOK_URL="https://discord.com/api/webhooks/..."
 
+# Set mode (defaults to SANDBOX if unset)
+#   SANDBOX     — Paper trading with per-minute chart, auto-execute buy/sell/hold
+#   COMPETITION — Manual advisory desk, outputs trade recommendations
+export RUN_MODE=SANDBOX
+
 # Build and start
 docker compose up -d
 
@@ -151,7 +157,7 @@ docker compose logs -f --tail 100
 docker compose down
 ```
 
-Configuration via `docker-compose.yml`: 512MB memory limit, named volume `glassbox_data` for persistent state, auto-restart on failure.
+Configuration via `docker-compose.yml`: 512MB memory limit, named volume `glassbox_data` for persistent state, auto-restart on failure, run mode driven by `RUN_MODE` env var (no rebuild needed to switch).
 
 ## Features Implemented
 

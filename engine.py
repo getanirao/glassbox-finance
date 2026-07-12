@@ -431,16 +431,24 @@ def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_n
         if long_sent is not None:
             base = f"{ticker} [{rolling_sent:+.2f} / {long_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> No headlines."
         return base
+    name = TICKER_NAMES.get(ticker, "").lower()
     best_h = headlines[0]
-    best_abs = -1.0
+    best_score = -1.0
     for h in headlines:
-        tokens = re.findall(r"[a-z]+", h.lower())
+        hl = h.lower()
+        tokens = re.findall(r"[a-z]+", hl)
         pos = sum(1 for t in tokens if t in POSITIVE_LEXICON)
         neg = sum(1 for t in tokens if t in NEGATIVE_LEXICON)
         total = pos + neg
         net = (pos - neg) / total if total > 0 else 0.0
-        if abs(net) > best_abs:
-            best_abs = abs(net)
+        relevance = 1.0
+        if ticker.lower() in hl:
+            relevance = 3.0
+        elif name and any(w in hl for w in name.split()):
+            relevance = 2.0
+        score = abs(net) + relevance
+        if score > best_score:
+            best_score = score
             best_h = h
     if len(best_h) > 130:
         truncated = best_h[:130]

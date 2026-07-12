@@ -43,6 +43,32 @@ TICKERS = [
     "JPM", "GS", "BAC", "MS", "C",
 ]
 
+TICKER_NAMES = {
+    "AAPL": "apple", "MSFT": "microsoft", "GOOGL": "alphabet", "META": "meta",
+    "NVDA": "nvidia", "INTC": "intel", "AMD": "amd", "CSCO": "cisco",
+    "CRM": "salesforce", "ORCL": "oracle", "IBM": "ibm", "ADBE": "adobe",
+    "NFLX": "netflix", "NOW": "servicenow",
+    "JNJ": "johnson", "PFE": "pfizer", "UNH": "unitedhealth", "ABBV": "abbvie",
+    "MRK": "merck", "ABT": "abbott", "TMO": "thermo fisher", "LLY": "eli lilly",
+    "BMY": "bristol myers", "MDT": "medtronic", "DHR": "danaher", "AMGN": "amgen",
+    "XOM": "exxon", "CVX": "chevron", "COP": "conocophillips", "SLB": "schlumberger",
+    "EOG": "eog resources", "OXY": "occidental", "HAL": "halliburton",
+    "MPC": "marathon petroleum", "PSX": "phillips 66", "VLO": "valero",
+    "AMZN": "amazon", "TSLA": "tesla", "HD": "home depot", "MCD": "mcdonald",
+    "NKE": "nike", "DIS": "disney", "SBUX": "starbucks", "LOW": "lowe",
+    "BKNG": "booking", "TGT": "target", "TJX": "tjx", "ROST": "ross",
+    "CAT": "caterpillar", "GE": "general electric", "BA": "boeing",
+    "HON": "honeywell", "RTX": "raytheon", "UPS": "ups", "UNP": "union pacific",
+    "LMT": "lockheed martin", "GD": "general dynamics", "CARR": "carrier",
+    "EMR": "emerson", "ETN": "eaton",
+    "NEE": "next era", "DUK": "duke energy", "SO": "southern company",
+    "D": "dominion energy", "AEP": "american electric", "EXC": "exelon",
+    "SRE": "sempra", "PEG": "public service", "ED": "consolidated edison",
+    "WEC": "wec energy",
+    "JPM": "jpmorgan", "GS": "goldman sachs", "BAC": "bank of america",
+    "MS": "morgan stanley", "C": "citigroup",
+}
+
 INSTITUTIONAL_BANKS = {"JPM", "GS", "BAC", "MS", "C"}
 
 POSITIVE_LEXICON = {

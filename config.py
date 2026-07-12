@@ -88,13 +88,10 @@ NEGATIVE_LEXICON = {
     "regulatory", "decline", "fall", "drop", "sell", "below", "weak",
     "warning", "cut", "lower", "fail", "negative", "volatility",
     "short", "underperform", "underperformed", "layoff", "fraud",
-    "emissions", "brutal", "verdict", "talc", "scandal", "probe",
-    "concern", "concerns", "controversy", "slowdown", "crisis",
-    "hurdle", "headwind", "liability", "overhang", "overvalued",
-    "unwind", "challenge", "challenged", "challenges", "suspended",
+    "brutal", "verdict", "scandal", "probe", "controversy",
+    "crisis", "liability", "overvalued", "suspended",
     "delay", "delays", "worst", "trouble", "damage", "deficit",
-    "settlement", "charges", "impairment", "restructuring",
-    "corrective", "corrected", "setback", "setbacks",
+    "settlement", "charges", "impairment", "restructuring", "setback", "setbacks",
 }
 
 CRITICAL_NEGATIVE_LEXICON = {

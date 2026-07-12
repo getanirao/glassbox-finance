@@ -74,9 +74,12 @@ INSTITUTIONAL_BANKS = {"JPM", "GS", "BAC", "MS", "C"}
 POSITIVE_LEXICON = {
     "revenue", "growth", "beats", "beat", "profit", "upgrade", "upgraded",
     "bullish", "dividend", "earnings", "rally", "outperform", "outperformed",
-    "strong", "record", "positive", "raised", "expansion", "guidance",
+    "strong", "record", "positive", "raised", "raised", "expansion", "guidance",
     "buy", "growing", "profitable", "gains", "surge", "recovery",
     "momentum", "opportunity", "innovation", "confidence", "optimistic",
+    "breakthrough", "leader", "leadership", "outlook", "accelerate",
+    "accelerated", "accelerating", "expansion", "uptick", "upside",
+    "awarded", "partnership", "partnered", "exceed", "exceeded",
 }
 
 NEGATIVE_LEXICON = {
@@ -85,6 +88,18 @@ NEGATIVE_LEXICON = {
     "regulatory", "decline", "fall", "drop", "sell", "below", "weak",
     "warning", "cut", "lower", "fail", "negative", "volatility",
     "short", "underperform", "underperformed", "layoff", "fraud",
+    "emissions", "brutal", "verdict", "talc", "scandal", "probe",
+    "concern", "concerns", "controversy", "slowdown", "crisis",
+    "hurdle", "headwind", "liability", "overhang", "overvalued",
+    "unwind", "challenge", "challenged", "challenges", "suspended",
+    "delay", "delays", "worst", "trouble", "damage", "deficit",
+    "settlement", "charges", "impairment", "restructuring",
+    "corrective", "corrected", "setback", "setbacks",
+}
+
+CRITICAL_NEGATIVE_LEXICON = {
+    "verdict", "lawsuit", "fraud", "scandal", "bankruptcy",
+    "investigation", "penalty", "settlement", "crisis", "liability",
 }
 
 DISCORD_ADMIN_ROLE = "Admin"

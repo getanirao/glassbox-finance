@@ -446,7 +446,8 @@ def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_n
             relevance = 3.0
         elif name and any(w in hl for w in name.split()):
             relevance = 2.0
-        score = abs(net) + relevance
+        critical_neg = sum(1 for t in tokens if t in CRITICAL_NEGATIVE_LEXICON)
+        score = abs(net) + relevance + critical_neg * 2.0
         if score > best_score:
             best_score = score
             best_h = h
@@ -625,8 +626,9 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
         tokens = re.findall(r"[a-z]+", title.lower())
         pos = sum(1 for t in tokens if t in POSITIVE_LEXICON)
         neg = sum(1 for t in tokens if t in NEGATIVE_LEXICON)
-        total = pos + neg
-        net = (pos - neg) / total if total > 0 else 0.0
+        critical = sum(1 for t in tokens if t in CRITICAL_NEGATIVE_LEXICON)
+        total = pos + neg + critical
+        net = (pos - neg - critical) / total if total > 0 else 0.0
         net = max(-1.0, min(1.0, net))
         news_cache["headlines"].append({
             "text": title,

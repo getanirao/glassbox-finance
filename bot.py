@@ -39,11 +39,16 @@ class GlassboxBot(commands.Bot):
 
 
 def admin_check(interaction: discord.Interaction) -> bool:
-    return True
+    user = interaction.user
+    roles = getattr(user, "roles", [])
+    return any(role.name == DISCORD_ADMIN_ROLE for role in roles)
 
 
 def trader_check(interaction: discord.Interaction) -> bool:
-    return True
+    user = interaction.user
+    roles = getattr(user, "roles", [])
+    allowed = {DISCORD_ADMIN_ROLE, DISCORD_TRADER_ROLE}
+    return any(role.name in allowed for role in roles)
 
 
 # ── Engine Cog ───────────────────────────────────────────────────────────
@@ -170,11 +175,9 @@ class QueryCog(commands.Cog):
         lines.append("-" * len(header))
         total = 0
         for ticker, pos in ledger["holdings"].items():
-            from engine import load_sandbox_ledger  # already imported
             try:
-                import yfinance as yf
-                stock = yf.Ticker(ticker)
-                price = stock.fast_info.last_price
+                from engine import _get_price
+                price = _get_price(ticker)
             except Exception:
                 price = 0
             val = pos["shares"] * price
@@ -266,6 +269,6 @@ class QueryCog(commands.Cog):
             f"`/run_sandbox` — Trigger immediate SANDBOX cycle",
             f"`/run_comp` — Trigger immediate COMPETITION cycle",
             f"",
-            f"No role restrictions — all commands available to everyone.",
+            f"Admin commands require `{DISCORD_ADMIN_ROLE}`. Query commands require `{DISCORD_TRADER_ROLE}` or `{DISCORD_ADMIN_ROLE}`.",
         ]
         await interaction.response.send_message("\n".join(lines), ephemeral=False)

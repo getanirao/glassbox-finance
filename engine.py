@@ -17,6 +17,10 @@ import matplotlib.dates as mdates
 
 from config import *
 
+_TICKER_CACHE = {}
+_PRICE_CACHE = {}
+_FMP_QUOTE_CACHE = {}
+
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -125,9 +129,15 @@ def check_market_clock():
     eastern = zoneinfo.ZoneInfo("US/Eastern")
     now = datetime.datetime.now(eastern)
     weekday = now.weekday()
+    today = now.date().isoformat()
     current_time_minutes = now.hour * 60 + now.minute
     open_minutes = 9 * 60 + 30
     close_minutes = 16 * 60
+    if today in NYSE_FULL_DAY_CLOSURES_2026:
+        return "ANALYTICAL_OFF_HOURS", now
+    if today in NYSE_EARLY_CLOSES_2026:
+        hour, minute = NYSE_EARLY_CLOSES_2026[today].split(":")
+        close_minutes = int(hour) * 60 + int(minute)
     if weekday < 5 and open_minutes <= current_time_minutes < close_minutes:
         return "MARKET_OPEN", now
     return "ANALYTICAL_OFF_HOURS", now
@@ -208,19 +218,73 @@ def save_sandbox_ledger(ledger):
         json.dump(ledger, f, indent=2)
 
 
+def get_ticker(ticker):
+    if ticker not in _TICKER_CACHE:
+        _TICKER_CACHE[ticker] = yf.Ticker(ticker)
+    return _TICKER_CACHE[ticker]
+
+
+def _get_fmp_prices(tickers):
+    api_key = os.environ.get("FMP_API_KEY", "")
+    if not api_key:
+        return {}
+    cache_key = tuple(sorted(tickers))
+    cached = _FMP_QUOTE_CACHE.get(cache_key)
+    now = time.time()
+    if cached and now - cached["time"] < PRICE_CACHE_SECONDS:
+        return cached["prices"]
+    prices = {}
+    try:
+        for start in range(0, len(tickers), FMP_BATCH_SIZE):
+            batch = tickers[start:start + FMP_BATCH_SIZE]
+            url = f"https://financialmodelingprep.com/api/v3/quote/{','.join(batch)}"
+            resp = requests.get(url, params={"apikey": api_key}, timeout=15)
+            resp.raise_for_status()
+            for row in resp.json():
+                symbol = row.get("symbol")
+                price = row.get("price")
+                if symbol and price and price > 0:
+                    prices[symbol] = float(price)
+    except Exception as e:
+        print(f"  [Market Data] FMP quote fallback failed - {e}. Using yfinance.")
+        prices = {}
+    _FMP_QUOTE_CACHE[cache_key] = {"time": now, "prices": prices}
+    return prices
+
+
+def get_prices(tickers):
+    now = time.time()
+    prices = {}
+    missing = []
+    for ticker in tickers:
+        cached = _PRICE_CACHE.get(ticker)
+        if cached and now - cached["time"] < PRICE_CACHE_SECONDS:
+            prices[ticker] = cached["price"]
+        else:
+            missing.append(ticker)
+    if missing:
+        fmp_prices = _get_fmp_prices(missing)
+        for ticker, price in fmp_prices.items():
+            _PRICE_CACHE[ticker] = {"time": now, "price": price}
+            prices[ticker] = price
+        for ticker in missing:
+            if ticker not in prices:
+                price = _get_yfinance_price(ticker)
+                _PRICE_CACHE[ticker] = {"time": now, "price": price}
+                prices[ticker] = price
+    return prices
+
+
 def collect_spot_prices(state, tickers):
     now = datetime.datetime.now(datetime.timezone.utc)
     if "price_log" not in state:
         state["price_log"] = {}
+    batch_prices = get_prices(tickers)
     for ticker in tickers:
         if ticker not in state["price_log"]:
             state["price_log"][ticker] = []
         try:
-            stock = yf.Ticker(ticker)
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else None
+            price = batch_prices.get(ticker)
             if price and price > 0:
                 state["price_log"][ticker].append({"t": now.isoformat(), "p": price})
                 if len(state["price_log"][ticker]) > 10:
@@ -487,7 +551,7 @@ def build_news_roundup(alerts, et_now):
 def build_master_payload(results, market_state, et_now, total_tickers, clock_state=None):
     ranked = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
     top = ranked[:MAX_PORTFOLIO_HOLDINGS]
-    total_score = sum(r["adjusted_score"] for r in top) if top else 1
+    allocation_plan, cash_reserve = build_allocation_plan(top, STARTING_CAPITAL)
     n_passing = len(ranked)
     n_holding = len(top)
     lines = []
@@ -497,24 +561,17 @@ def build_master_payload(results, market_state, et_now, total_tickers, clock_sta
     else:
         lines.append(f"Status: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
     lines.append(f"Scanner: {WATCHLIST_SCANNER_LIMIT} tickers | Passed: {n_passing} | Funded: {n_holding}")
-    lines.append(f"Capital: ${STARTING_CAPITAL:,}")
+    lines.append(f"Capital: ${STARTING_CAPITAL:,} | Reserve: ${cash_reserve:,.2f}")
     lines.append("")
     lines.append("```")
     header = f"{'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'$ Amt':>12} {'Shares':>8}"
     lines.append(header)
     lines.append("-" * len(header))
     for r in top:
-        score = r["adjusted_score"]
-        pct = score / total_score * 100
-        dollar_alloc = STARTING_CAPITAL * (pct / 100)
-        try:
-            stock = yf.Ticker(r["ticker"])
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else 0
-        except Exception:
-            price = 0
+        plan = allocation_plan.get(r["ticker"], {"pct": 0, "dollar_alloc": 0})
+        pct = plan["pct"]
+        dollar_alloc = plan["dollar_alloc"]
+        price = _get_price(r["ticker"])
         target_shares = int(dollar_alloc / price) if price and price > 0 else 0
         sent_label = f"{r['sentiment']:+.3f}"
         lines.append(f"{r['ticker']:<8} {r['status']:<22} {sent_label:>10} {pct:>9.2f}% ${dollar_alloc:>9,.2f} {target_shares:>7}")
@@ -655,7 +712,7 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
 
 def process_ticker(ticker, index, total, news_cache):
     print(f"\n  [{index}/{total}] Processing {ticker} ...")
-    stock = yf.Ticker(ticker)
+    stock = get_ticker(ticker)
     inc = stock.income_stmt
     if not validate_statement(inc, "Income Statement"):
         print(f"  [{index}/{total}] {ticker} SKIPPED - No income statement data.")
@@ -691,8 +748,10 @@ def process_ticker(ticker, index, total, news_cache):
     net_sentiment, penalty, headlines, rolling_pos, rolling_neg, rolling_count, long_sent, long_pos, long_neg, long_count = sentiment_gate(stock, ticker, news_cache, skip_fetch=True)
     if solvency_ok and net_sentiment < 0.0:
         print(f"  [{index}/{total}] [Semantic Analysis]: Computational linguistics detect high rhetorical negative sentiment across public news sources, indicating structural headline risk that down-weights our core fundamental asset valuation.")
-    adjusted_score = (health_score * penalty) if solvency_ok else health_score
+    adjusted_score, hist_vol, risk_multiplier = risk_adjusted_score(health_score, penalty, ticker, solvency_ok)
     status = "PASS (Bank Neutral)" if ticker in INSTITUTIONAL_BANKS else ("PASS" if solvency_ok else "FAIL")
+    if solvency_ok and hist_vol is not None:
+        print(f"  [{index}/{total}] [Risk Overlay]: 63d annualized volatility {hist_vol:.1%}; score multiplier {risk_multiplier:.3f}.")
     print(f"  [{index}/{total}] {ticker} {status} (Score: {adjusted_score:.1f}/100)")
     return {
         "ticker": ticker,
@@ -704,6 +763,8 @@ def process_ticker(ticker, index, total, news_cache):
         "debt_to_equity": dte,
         "sentiment": net_sentiment,
         "penalty": penalty,
+        "historical_volatility": hist_vol,
+        "risk_multiplier": risk_multiplier,
         "adjusted_score": adjusted_score,
         "top_headline": headlines[0] if headlines else "No headlines available.",
         "headlines": headlines,
@@ -732,10 +793,11 @@ def display_portfolio_table(results):
     top = ranked[:MAX_PORTFOLIO_HOLDINGS]
     n_passing = len(ranked)
     n_holding = len(top)
-    total_score = sum(r["adjusted_score"] for r in top)
+    allocation_plan, cash_reserve = build_allocation_plan(top, STARTING_CAPITAL)
     print(f"\n{'='*90}")
     print(f"  PORTFOLIO DASHBOARD — Allocation of ${STARTING_CAPITAL:,}")
     print(f"  [Scanner] {WATCHLIST_SCANNER_LIMIT} evaluated | {n_passing} passed | Top {n_holding} funded")
+    print(f"  [Risk] Max position {MAX_POSITION_PCT:.0%} | Cash reserve ${cash_reserve:,.2f} ({cash_reserve / STARTING_CAPITAL:.1%})")
     print(f"{'='*90}")
     header = f"  {'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'$ Amt':>12} {'Shares':>8}"
     print(header)
@@ -744,17 +806,10 @@ def display_portfolio_table(results):
         ticker = r["ticker"]
         status = r["status"]
         sent = r["sentiment"]
-        score = r["adjusted_score"]
-        pct = score / total_score * 100 if total_score > 0 else 0
-        dollar_alloc = STARTING_CAPITAL * (pct / 100)
-        try:
-            stock = yf.Ticker(ticker)
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else 0
-        except Exception:
-            price = 0
+        plan = allocation_plan.get(ticker, {"pct": 0, "dollar_alloc": 0})
+        pct = plan["pct"]
+        dollar_alloc = plan["dollar_alloc"]
+        price = _get_price(ticker)
         if price and price > 0:
             target_shares = int(dollar_alloc / price)
         else:
@@ -812,9 +867,9 @@ def generate_portfolio_chart(ledger):
     print(f"  [Chart] {SANDBOX_CHART} saved ({len(history)} data points).")
 
 
-def _get_price(ticker):
+def _get_yfinance_price(ticker):
     try:
-        stock = yf.Ticker(ticker)
+        stock = get_ticker(ticker)
         price = stock.fast_info.last_price
         if price is None or price <= 0:
             hist = stock.history(period="1d")
@@ -824,15 +879,102 @@ def _get_price(ticker):
         return 0
 
 
+def _get_price(ticker):
+    return get_prices([ticker]).get(ticker, 0)
+
+
+def estimate_historical_volatility(ticker):
+    try:
+        stock = get_ticker(ticker)
+        hist = stock.history(period="6mo", auto_adjust=True)
+        if hist.empty or "Close" not in hist:
+            return None
+        returns = hist["Close"].pct_change().dropna().tail(HISTORICAL_VOL_WINDOW_DAYS)
+        if len(returns) < 20:
+            return None
+        return float(returns.std() * math.sqrt(252))
+    except Exception:
+        return None
+
+
+def risk_adjusted_score(health_score, penalty, ticker, solvency_ok):
+    if not solvency_ok:
+        return health_score, None, 1.0
+    volatility = estimate_historical_volatility(ticker)
+    if volatility is None:
+        return health_score * penalty, None, 1.0
+    bounded_vol = min(MAX_HISTORICAL_VOL, max(MIN_HISTORICAL_VOL, volatility))
+    vol_score = 1.0 - ((bounded_vol - MIN_HISTORICAL_VOL) / (MAX_HISTORICAL_VOL - MIN_HISTORICAL_VOL))
+    risk_multiplier = (1 - VOLATILITY_SCORE_WEIGHT) + (VOLATILITY_SCORE_WEIGHT * vol_score)
+    return health_score * penalty * risk_multiplier, volatility, risk_multiplier
+
+
+def build_allocation_plan(ranked, capital):
+    if not ranked:
+        return {}, capital
+    deployable_capital = capital * (1 - MIN_CASH_RESERVE_PCT)
+    weights = {r["ticker"]: 0.0 for r in ranked}
+    remaining = list(ranked)
+    remaining_weight = 1.0
+    while remaining:
+        total_score = sum(max(r["adjusted_score"], 0) for r in remaining)
+        if total_score <= 0:
+            equal = remaining_weight / len(remaining)
+            for r in remaining:
+                weights[r["ticker"]] = min(MAX_POSITION_PCT, equal)
+            break
+        capped = []
+        for r in remaining:
+            raw_weight = remaining_weight * max(r["adjusted_score"], 0) / total_score
+            if raw_weight > MAX_POSITION_PCT:
+                weights[r["ticker"]] = MAX_POSITION_PCT
+                capped.append(r)
+        if not capped:
+            for r in remaining:
+                weights[r["ticker"]] = remaining_weight * max(r["adjusted_score"], 0) / total_score
+            break
+        remaining = [r for r in remaining if r not in capped]
+        remaining_weight -= MAX_POSITION_PCT * len(capped)
+        if remaining_weight <= 0:
+            break
+    plan = {
+        ticker: {
+            "pct": weight * 100,
+            "dollar_alloc": deployable_capital * weight,
+        }
+        for ticker, weight in weights.items()
+    }
+    cash_reserve = capital - sum(item["dollar_alloc"] for item in plan.values())
+    return plan, cash_reserve
+
+
+def current_drawdown(ledger):
+    history = ledger.get("history", [])
+    if not history:
+        return 0.0, STARTING_CAPITAL, STARTING_CAPITAL
+    values = [h.get("portfolio_value", STARTING_CAPITAL) for h in history]
+    high_water = max(max(values), STARTING_CAPITAL)
+    current_value = values[-1]
+    if high_water <= 0:
+        return 0.0, current_value, high_water
+    return (high_water - current_value) / high_water, current_value, high_water
+
+
 def sandbox_execute(ranked, total_score):
     ledger = load_sandbox_ledger()
     new_tickers = {r["ticker"] for r in ranked}
+    drawdown, current_value, high_water = current_drawdown(ledger)
+    drawdown_locked = drawdown >= MAX_DRAWDOWN_PCT
+    allocation_plan, cash_reserve = build_allocation_plan(ranked, current_value)
 
     print(f"\n{'='*80}")
     print(f"  SANDBOX EXECUTION — Portfolio Rebalance (Sell / Hold / Buy)")
     print(f"{'='*80}")
     print(f"  Cash:           ${ledger['cash_balance']:>10,.2f}")
     print(f"  Current Holdings: {len(ledger['holdings'])} positions")
+    print(f"  Risk Guard:     Drawdown {drawdown:.1%} / {MAX_DRAWDOWN_PCT:.1%} | Reserve target ${cash_reserve:,.2f}")
+    if drawdown_locked:
+        print(f"  Risk Guard:     Drawdown lock active. New BUY orders suppressed until recovery.")
     print(f"{'='*80}")
 
     realized_pnl = 0.0
@@ -863,12 +1005,12 @@ def sandbox_execute(ranked, total_score):
             print(f"  HOLD  {pos['shares']} shares of {ticker} @ ${price:.2f}  (Value: ${val:,.2f})")
 
     # Phase 3: BUY — new positions only
-    buy_targets = [r for r in ranked if r["ticker"] not in ledger["holdings"]]
-    buy_total_score = sum(r["adjusted_score"] for r in buy_targets) or 1
+    buy_targets = [] if drawdown_locked else [r for r in ranked if r["ticker"] not in ledger["holdings"]]
+    available_cash = max(0.0, ledger["cash_balance"] - cash_reserve)
     for r in buy_targets:
         ticker = r["ticker"]
-        pct = r["adjusted_score"] / buy_total_score * 100
-        dollar_alloc = ledger["cash_balance"] * (pct / 100)
+        target_alloc = allocation_plan.get(ticker, {}).get("dollar_alloc", 0)
+        dollar_alloc = min(target_alloc, available_cash)
         price = _get_price(ticker)
         if price and price > 0:
             target_shares = int(dollar_alloc / price)
@@ -876,6 +1018,7 @@ def sandbox_execute(ranked, total_score):
                 cost = target_shares * price
                 ledger["holdings"][ticker] = {"shares": target_shares, "avg_price": price}
                 ledger["cash_balance"] -= cost
+                available_cash -= cost
                 print(f"  BUY   {target_shares} shares of {ticker} @ ${price:.2f}  (${cost:,.2f})")
 
     # Valuate
@@ -891,6 +1034,8 @@ def sandbox_execute(ranked, total_score):
     }
     if realized_pnl != 0:
         entry["realized_pnl"] = round(realized_pnl, 2)
+    if drawdown_locked:
+        entry["drawdown_lock"] = True
     ledger["history"].append(entry)
     save_sandbox_ledger(ledger)
 
@@ -972,7 +1117,7 @@ def run_news_stream(news_cache, et_now):
     total = len(TICKERS)
     for i, ticker in enumerate(TICKERS, start=1):
         try:
-            stock = yf.Ticker(ticker)
+            stock = get_ticker(ticker)
             sent, penalty, headlines, sp, sn, sc, ls, lp, ln, lc = sentiment_gate(stock, ticker, news_cache)
             news_alerts.append({
                 "ticker": ticker,

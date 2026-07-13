@@ -3,9 +3,15 @@ import os
 import re
 import json
 import numpy as np
-from config import FINBERT_TEMPERATURE
+from config import BUSINESS_RISK_SENTIMENT_FLOOR, FINBERT_TEMPERATURE, MODEL_DIR
 
 _NEGATION_WORDS = {"not", "no", "never", "neither", "nor", "t"}
+_BUSINESS_RISK_PATTERNS = [
+    re.compile(r"\blos(?:e|es|ing|t)\s+(viewers|subscribers|users|customers|market\s+share|traffic|revenue|sales)\b"),
+    re.compile(r"\b(viewer|subscriber|user|customer|revenue|sales)\s+loss(?:es)?\b"),
+    re.compile(r"\b(viewership|subscribers?|users?|customers?|traffic|revenue|sales)\s+(decline|declines|declined|fall|falls|fell|drop|drops|dropped)\b"),
+    re.compile(r"\b(churn|cancellations?|downgrades?)\s+(rise|rises|rose|increase|increases|increased)\b"),
+]
 
 
 class FinBERTScorer:
@@ -55,8 +61,8 @@ class FinBERTScorer:
         """
         self._ensure_loaded()
         if self._session:
-            return self._score_onnx(headline)
-        return self._score_lm(headline)
+            return _apply_business_risk_floor(headline, *self._score_onnx(headline))
+        return _apply_business_risk_floor(headline, *self._score_lm(headline))
 
     def _score_onnx(self, headline):
         inputs = self._tokenizer(
@@ -106,6 +112,8 @@ _SCORER = None
 
 def get_scorer(model_dir=None):
     global _SCORER
+    if model_dir is None:
+        model_dir = MODEL_DIR
     if _SCORER is None:
         _SCORER = FinBERTScorer(model_dir=model_dir)
     return _SCORER
@@ -113,3 +121,12 @@ def get_scorer(model_dir=None):
 
 def score_headline(headline, model_dir=None):
     return get_scorer(model_dir=model_dir).score(headline)
+
+
+def _apply_business_risk_floor(headline, net, pos, neg):
+    text = " ".join(re.findall(r"[a-z]+", headline.lower()))
+    if any(pattern.search(text) for pattern in _BUSINESS_RISK_PATTERNS):
+        net = min(net, BUSINESS_RISK_SENTIMENT_FLOOR)
+        neg = max(neg, abs(BUSINESS_RISK_SENTIMENT_FLOOR))
+        pos = max(0.0, neg + net)
+    return net, pos, neg

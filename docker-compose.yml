@@ -1,16 +1,48 @@
+x-glassbox-build: &glassbox-build
+  context: .
+  args:
+    PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
+    EXPORT_FINBERT: ${EXPORT_FINBERT:-0}
+
+x-glassbox-env: &glassbox-env
+  RUN_MODE: ${RUN_MODE:-COMPETITION}
+  MPLBACKEND: Agg
+  PYTHONUNBUFFERED: "1"
+
 services:
   glassbox:
-    build: .
+    build: *glassbox-build
+    platform: ${DOCKER_PLATFORM:-linux/arm64}
     container_name: glassbox-finance
     restart: unless-stopped
-    mem_limit: 512m
-    mem_reservation: 256m
+    mem_limit: ${GLASSBOX_MEM_LIMIT:-1536m}
+    mem_reservation: ${GLASSBOX_MEM_RESERVATION:-512m}
+    command: ["python", "main.py", "--bot"]
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - WEBHOOK_URL=${WEBHOOK_URL}
-      - RUN_MODE=${RUN_MODE:-COMPETITION}
-      - MPLBACKEND=Agg
-      - PYTHONUNBUFFERED=1
+      <<: *glassbox-env
+      BOT_TOKEN: ${BOT_TOKEN}
+      WEBHOOK_URL: ${WEBHOOK_URL}
+    volumes:
+      - glassbox_data:/app/data
+    stop_grace_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  news-worker:
+    profiles: ["worker"]
+    build: *glassbox-build
+    platform: ${DOCKER_PLATFORM:-linux/arm64}
+    container_name: glassbox-news-worker
+    restart: unless-stopped
+    mem_limit: ${GLASSBOX_WORKER_MEM_LIMIT:-768m}
+    mem_reservation: ${GLASSBOX_WORKER_MEM_RESERVATION:-256m}
+    command: ["python", "main.py", "--news-worker"]
+    environment:
+      <<: *glassbox-env
+      WEBHOOK_URL: ""
     volumes:
       - glassbox_data:/app/data
     stop_grace_period: 30s

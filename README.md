@@ -8,7 +8,7 @@ Quantitative finance engine providing real-time sentiment-driven BUY/HOLD/SELL r
 - **Solvency Screening Engine Live** — `evaluate_solvency()` computes Current Ratio and Debt-to-Equity Ratio from live balance-sheet data. Assets with CR < 1.2 or D/E > 1.5 are rejected. Financial institutions (JPM, GS, BAC, MS, C) skip solvency gates with a neutral baseline score of 75.0.
 - **ROE + P/E (P/B for Banks) Valuation Multiplier Active** — After solvency, `health_score` is multiplied by a blended factor: 50/50 ROE+P/E for non-banks, 70/30 ROE+P/B for banks. ROE normalized to 20% par (cap 0.5–1.5×). P/E sweet spot 10–20×; P/B sweet spot 1.0–1.5×. Prevents overvaluing high-ROE expensive stocks.
 - **24-Hour Time Cooldown Gate Active** — Final BUY/HOLD/SELL recommendations issued at most once per 24 hours during NYSE market open. Predicted allocation re-computed every 60-min news cycle regardless of gate or market state.
-- **FinBERT Sentiment Scoring (ONNX Quantized)** — `ProsusAI/finbert` exported to INT8 ONNX at Docker build time; runs inference via `onnxruntime` at runtime (no PyTorch). Temperature scaling (T=0.5) applied to logits before softmax to sharpen compressed 3-class scores. Loughran-McDonald lexicon (2,744 words) available as offline fallback.
+- **FinBERT Sentiment Scoring (ONNX Quantized)** — `ProsusAI/finbert` can be exported to INT8 ONNX at Docker build time with `EXPORT_FINBERT=1`; runtime inference uses `onnxruntime` when the model exists. Temperature scaling (T=0.5) applied to logits before softmax to sharpen compressed 3-class scores. Loughran-McDonald lexicon (2,744 words) remains the default offline fallback.
 - **75-Ticker Watchlist Scanner Active** — Broad-market universe across Technology, Healthcare, Energy, Consumer Cyclical, Industrials, Utilities, and Finance. Top 12 per cycle by blended solvency + sentiment score.
 - **Manual System Reset Gate Available** — Running `python main.py --clear` wipes news cache, competition ledger, gate timestamp, deletes both Discord dashboard and news roundup messages from channel history, and resets PIPELINE.md log entries.
 - **BUY/HOLD/SELL Recommendations Active** — Each 60-min cycle filters predicted top-12 to only sentiment ≥ 0.0, then issues BUY for top 6 (score-weighted allocation from cash), HOLD for owned tickers past the cap, SELL for owned tickers that dropped out or turned negative. Score-weighted BUY sizing now enforces the configured max-position cap after redistribution so one name cannot exceed risk/reward bounds. Dashboard only shows eligible tickers (no negative sentiment rows). Final recommendations issued with `EXECUTE BY HH:MM UTC` only when gate expired + market open.
@@ -24,12 +24,17 @@ Quantitative finance engine providing real-time sentiment-driven BUY/HOLD/SELL r
 - **Two-Clock Architecture Active** — **60-min news clock** fetches headlines, runs full ticker evaluation, updates predicted allocation on dashboard. **60-sec visualization clock** refreshes portfolio value, regenerates chart, and PATCHes the competition dashboard with live spot prices.
 - **Self-Editing Discord Competition Dashboard Active** — Shows real holdings table (ticker, shares, avg price, current price, value, unrealized P&L), predicted top-12 allocation with BUY/HOLD/SELL recommendations, and portfolio chart. PATCHed every 60 seconds. 404 recovery clears stale message ID and auto-posts new message.
 - **Automated Discord Message Purge on Reset** — `--clear` sends HTTP DELETE to remove competition dashboard and news roundup messages from channel history before cleaning local state.
+- **Oracle Always Free ARM Deployment Ready** — Docker now targets `linux/arm64` by default, uses Python 3.12 multi-arch images, and makes FinBERT ONNX export opt-in (`EXPORT_FINBERT=1`) so the app can run on OCI Ampere A1 without a heavyweight PyTorch build.
+- **News Worker Roles Available** — `--news-worker` and `--news-worker-once` run fetch/score-only cycles without Discord dashboards or recommendations. Local engine/worker containers coordinate through an atomic stale-aware news lock, and a scheduled GitHub Actions worker runs the one-shot mode with cache artifacts until shared Postgres storage is implemented.
 
 ## Command Reference
 
 ### Terminal Execution
 ```bash
 python main.py --comp --bot              # Engine + Discord bot (competition mode)
+python main.py --engine                  # Engine only, no Discord bot
+python main.py --news-worker             # Continuous fetch/score news worker only
+python main.py --news-worker-once        # One fetch/score cycle for cron/GitHub Actions
 python main.py --bot-only                 # Discord bot only, no engine
 python main.py --clear                    # Purge all state + Discord messages
 python main.py --help                     # Show usage
@@ -41,15 +46,21 @@ python main.py --help                     # Show usage
 | `--comp` | Competition advisory mode (default) |
 | `--bot` | Start Discord bot alongside engine |
 | `--bot-only` | Start only the Discord bot |
+| `--engine` | Start only the recommendation engine |
+| `--news-worker` | Continuously fetch and score news without Discord output |
+| `--news-worker-once` | Fetch and score news once, then exit |
 | `--clear` | Purge state files, delete Discord messages, reset PIPELINE.md |
 
 ### Docker
 ```bash
-docker compose up -d                      # Build and start
+docker compose up -d --build              # Build and start bot + engine on Oracle ARM
+docker compose --profile worker up -d     # Optional local news worker sharing same volume
 docker compose logs -f                    # Follow logs
 docker compose down                       # Stop gracefully
 docker compose exec glassbox python main.py --clear  # Reset state
 ```
+
+See `ORACLE_ALWAYS_FREE_SETUP.md` for the full OCI Ampere A1 bootstrap and `POSTGRES_STORAGE_HANDOFF.md` for the future Neon/Postgres shared-cache migration plan.
 
 ### Config Constants (`config.py`)
 | Constant | Value | Purpose |

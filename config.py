@@ -9,9 +9,14 @@ VOLATILITY_THRESHOLD = 0.005
 VOLATILITY_WINDOW = 5
 GRACE_MINUTES = 30
 WARMUP_MINUTES = 10
-LONG_WINDOW_HOURS = 168
+LONG_WINDOW_HOURS = 504
 LONG_SENTIMENT_WEIGHT = 0.3
-DECAY_HALF_LIFE_HOURS = 72
+DECAY_HALF_LIFE_HOURS = 336
+FINBERT_TEMPERATURE = 0.5
+SENTIMENT_BUY_THRESHOLD = 0.0
+MAX_BUYS_PER_CYCLE = 6
+MAX_POSITION_WEIGHT = 0.30
+SENTIMENT_IMPACT = 0.30
 WATCHLIST_SCANNER_LIMIT = 75
 MAX_PORTFOLIO_HOLDINGS = 12
 NEWS_CYCLE_HOURS = 1
@@ -25,9 +30,17 @@ NEWS_MESSAGE_STATE_FILE = os.path.join(DATA_DIR, ".news_message_state")
 OBSERVATION_FILE = os.path.join(DATA_DIR, ".observation_state")
 NEWS_CYCLE_FILE = os.path.join(DATA_DIR, ".last_news_run")
 NEWS_LOCK_FILE = os.path.join(DATA_DIR, ".news_lock")
+NEWS_CACHE_BACKUP = os.path.join(DATA_DIR, ".news_cache.backup.json")
 RUN_MODE_FILE = os.path.join(DATA_DIR, ".run_mode")
-SANDBOX_LEDGER = os.path.join(DATA_DIR, "sandbox_history.json")
-SANDBOX_CHART = os.path.join(DATA_DIR, "sandbox_performance.png")
+MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+
+INSTITUTIONAL_BANKS = {"JPM", "GS", "BAC", "MS", "C"}
+
+COMPETITION_LEDGER = os.path.join(DATA_DIR, "competition_ledger.json")
+COMPETITION_CHART = os.path.join(DATA_DIR, "competition_chart.png")
+COMPETITION_MESSAGE_STATE = os.path.join(DATA_DIR, ".competition_message_state")
+COMPETITION_PREDICTION_FILE = os.path.join(DATA_DIR, ".competition_prediction.json")
+EXECUTION_WINDOW_MINUTES = 1
 
 TICKERS = [
     "AAPL", "MSFT", "GOOGL", "META", "NVDA", "INTC", "AMD", "CSCO",
@@ -69,36 +82,9 @@ TICKER_NAMES = {
     "MS": "morgan stanley", "C": "citigroup",
 }
 
-INSTITUTIONAL_BANKS = {"JPM", "GS", "BAC", "MS", "C"}
-
-POSITIVE_LEXICON = {
-    "revenue", "growth", "beats", "beat", "profit", "upgrade", "upgraded",
-    "bullish", "dividend", "earnings", "rally", "outperform", "outperformed",
-    "strong", "record", "positive", "raised", "raised", "expansion", "guidance",
-    "buy", "growing", "profitable", "gains", "surge", "recovery",
-    "momentum", "opportunity", "innovation", "confidence", "optimistic",
-    "breakthrough", "leader", "leadership", "outlook", "accelerate",
-    "accelerated", "accelerating", "expansion", "uptick", "upside",
-    "awarded", "partnership", "partnered", "exceed", "exceeded",
-}
-
-NEGATIVE_LEXICON = {
-    "missing", "miss", "lawsuit", "loss", "risk", "downgrade", "downgraded",
-    "debt", "bankruptcy", "bearish", "fine", "penalty", "investigation",
-    "regulatory", "decline", "fall", "drop", "sell", "below", "weak",
-    "warning", "cut", "lower", "fail", "negative", "volatility",
-    "short", "underperform", "underperformed", "layoff", "fraud",
-    "brutal", "verdict", "scandal", "probe", "controversy",
-    "crisis", "liability", "overvalued", "suspended",
-    "delay", "delays", "worst", "trouble", "damage", "deficit",
-    "settlement", "charges", "impairment", "restructuring", "setback", "setbacks",
-}
-
-CRITICAL_NEGATIVE_LEXICON = {
-    "verdict", "lawsuit", "fraud", "scandal", "bankruptcy",
-    "investigation", "penalty", "settlement", "crisis", "liability",
-}
 
 DISCORD_ADMIN_ROLE = "Admin"
 DISCORD_TRADER_ROLE = "Trader"
 BOT_COMMAND_PREFIX = "/"
+
+from lexicon import POSITIVE_LEXICON, NEGATIVE_LEXICON, CRITICAL_NEGATIVE_LEXICON

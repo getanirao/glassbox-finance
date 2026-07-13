@@ -62,7 +62,6 @@ class EngineCog(commands.Cog):
         st = engine.get_status()
         mode = st.get("mode", "N/A")
         market = st.get("market_state", "N/A")
-        clock = st.get("clock_state", "N/A")
         last = st.get("last_run_utc", "never")
         uptime = st.get("uptime_start_utc", "unknown")
         paused = st.get("paused", False)
@@ -70,11 +69,10 @@ class EngineCog(commands.Cog):
         pv = st.get("portfolio_value", 0)
         news_last = st.get("news_last_run", "never")
         lines = [
-            f"**Glassbox Finance — Engine Status**",
+            f"**Glassbox Finance — Competition Engine Status**",
             f"",
             f"Mode: `{mode}`",
             f"Market: `{market}`",
-            f"Clock: `{clock}`",
             f"Paused: `{paused}`",
             f"Portfolio: `${pv:,.2f}`  |  Holdings: `{holdings} / {MAX_PORTFOLIO_HOLDINGS}`",
             f"Last Allocation: `{last}`",
@@ -126,51 +124,27 @@ class EngineCog(commands.Cog):
             engine.resume()
         await interaction.response.send_message("State files cleared. Ready for fresh run.", ephemeral=False)
 
-    @app_commands.command(name="run_sandbox", description="Trigger an immediate SANDBOX evaluation cycle (Admin only)")
-    @app_commands.check(admin_check)
-    async def cmd_run_sandbox(self, interaction: discord.Interaction):
-        engine = self.bot.engine
-        if not engine:
-            await interaction.response.send_message("Engine not running.", ephemeral=True)
-            return
-        engine.switch_mode("SANDBOX")
-        engine.trigger_now()
-        await interaction.response.send_message("SANDBOX cycle triggered.", ephemeral=False)
-
-    @app_commands.command(name="run_comp", description="Trigger an immediate COMPETITION evaluation cycle (Admin only)")
-    @app_commands.check(admin_check)
-    async def cmd_run_comp(self, interaction: discord.Interaction):
-        engine = self.bot.engine
-        if not engine:
-            await interaction.response.send_message("Engine not running.", ephemeral=True)
-            return
-        engine.switch_mode("COMPETITION")
-        engine.trigger_now()
-        await interaction.response.send_message("COMPETITION cycle triggered.", ephemeral=False)
-
-
 # ── Query Cog ────────────────────────────────────────────────────────────
 
 class QueryCog(commands.Cog):
     def __init__(self, bot: GlassboxBot):
         self.bot = bot
 
-    @app_commands.command(name="holdings", description="Show current portfolio holdings")
+    @app_commands.command(name="holdings", description="Show current competition portfolio holdings")
     @app_commands.check(trader_check)
     async def cmd_holdings(self, interaction: discord.Interaction):
-        from engine import load_sandbox_ledger
-        ledger = load_sandbox_ledger()
+        from engine import load_competition_ledger
+        ledger = load_competition_ledger()
         if not ledger["holdings"]:
             await interaction.response.send_message("No current holdings.", ephemeral=True)
             return
-        lines = [f"**Portfolio Holdings**  |  Cash: ${ledger['cash_balance']:,.2f}"]
+        lines = [f"**Competition Portfolio**  |  Cash: ${ledger['cash_balance']:,.2f}"]
         lines.append("```")
         header = f"{'Ticker':<8} {'Shares':>8} {'Avg Price':>12} {'Value':>14}"
         lines.append(header)
         lines.append("-" * len(header))
         total = 0
         for ticker, pos in ledger["holdings"].items():
-            from engine import load_sandbox_ledger  # already imported
             try:
                 import yfinance as yf
                 stock = yf.Ticker(ticker)
@@ -188,7 +162,7 @@ class QueryCog(commands.Cog):
     @app_commands.command(name="news", description="Show latest news roundup")
     @app_commands.check(trader_check)
     async def cmd_news(self, interaction: discord.Interaction):
-        from engine import load_news_cache, get_cache_window_hours, compute_rolling_sentiment, TICKERS
+        from engine import load_news_cache, compute_rolling_sentiment, TICKERS, LONG_WINDOW_HOURS
         cache = load_news_cache()
         entries = cache.get("headlines", [])
         if not entries:
@@ -207,23 +181,23 @@ class QueryCog(commands.Cog):
         lines = [f"**News Cache Summary**  |  {len(entries)} total headlines"]
         lines.append(f"Top tickers by short-term sentiment:")
         lines.append("```")
-        lines.append(f"{'Ticker':<8} {'Headlines':>10} {'Short Sent':>12} {'7d Sent':>10}")
+        lines.append(f"{'Ticker':<8} {'Headlines':>10} {'Short Sent':>12} {'21d Sent':>10}")
         lines.append("-" * 42)
         for t, cnt, ss, ls in top:
             lines.append(f"{t:<8} {cnt:>10} {ss:>+11.3f} {ls:>+9.3f}")
         lines.append("```")
         await interaction.response.send_message("\n".join(lines), ephemeral=False)
 
-    @app_commands.command(name="history", description="Show portfolio value history")
+    @app_commands.command(name="history", description="Show competition portfolio value history")
     @app_commands.check(trader_check)
     async def cmd_history(self, interaction: discord.Interaction):
-        from engine import load_sandbox_ledger, STARTING_CAPITAL
-        ledger = load_sandbox_ledger()
+        from engine import load_competition_ledger, STARTING_CAPITAL
+        ledger = load_competition_ledger()
         hist = ledger.get("history", [])
         if not hist:
             await interaction.response.send_message("No portfolio history yet.", ephemeral=True)
             return
-        lines = [f"**Portfolio History**  ({len(hist)} entries)"]
+        lines = [f"**Competition Portfolio History**  ({len(hist)} entries)"]
         lines.append("```")
         lines.append(f"{'#':<4} {'Value':>12} {'Change':>12}")
         lines.append("-" * 30)
@@ -236,14 +210,50 @@ class QueryCog(commands.Cog):
         lines.append("```")
         await interaction.response.send_message("\n".join(lines), ephemeral=False)
 
-    @app_commands.command(name="chart", description="Show latest performance chart")
+    @app_commands.command(name="chart", description="Show latest competition performance chart")
     @app_commands.check(trader_check)
     async def cmd_chart(self, interaction: discord.Interaction):
-        from engine import SANDBOX_CHART
-        if not os.path.exists(SANDBOX_CHART):
+        from engine import COMPETITION_CHART
+        if not os.path.exists(COMPETITION_CHART):
             await interaction.response.send_message("No chart generated yet.", ephemeral=True)
             return
-        await interaction.response.send_message(file=discord.File(SANDBOX_CHART), ephemeral=False)
+        await interaction.response.send_message(file=discord.File(COMPETITION_CHART), ephemeral=False)
+
+    @app_commands.command(name="trade", description="Log a real trade for the competition ledger")
+    @app_commands.check(trader_check)
+    async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int, price: float):
+        from engine import record_trade, load_competition_ledger
+        ticker = ticker.upper()
+        action = action.lower()
+        if action not in ("buy", "sell"):
+            await interaction.response.send_message("Action must be `buy` or `sell`.", ephemeral=True)
+            return
+        if shares <= 0:
+            await interaction.response.send_message("Shares must be positive.", ephemeral=True)
+            return
+        if price <= 0:
+            await interaction.response.send_message("Price must be positive.", ephemeral=True)
+            return
+        ok = record_trade(ticker, action, shares, price)
+        if not ok:
+            await interaction.response.send_message(f"Cannot sell {ticker} — not in ledger.", ephemeral=True)
+            return
+        ledger = load_competition_ledger()
+        pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else 0
+        lines = [
+            f"**Trade Logged** — {action.upper()} {shares} {ticker} @ ${price:.2f}",
+            f"Cash: ${ledger['cash_balance']:,.2f}  |  Portfolio: ${pv:,.2f}",
+            f"Holdings: {len(ledger['holdings'])} positions",
+        ]
+        await interaction.response.send_message("\n".join(lines), ephemeral=False)
+
+    @app_commands.command(name="hold", description="Confirm a HOLD recommendation from the engine")
+    @app_commands.check(trader_check)
+    async def cmd_hold(self, interaction: discord.Interaction, ticker: str):
+        from engine import record_hold
+        ticker = ticker.upper()
+        record_hold(ticker)
+        await interaction.response.send_message(f"HOLD confirmed for {ticker}.", ephemeral=False)
 
     @app_commands.command(name="help", description="Show available commands and their usage")
     async def cmd_help(self, interaction: discord.Interaction):
@@ -252,19 +262,19 @@ class QueryCog(commands.Cog):
             f"",
             f"**Query Commands** (Trader + Admin):",
             f"`/status` — Engine state, clock, portfolio value",
-            f"`/holdings` — Current portfolio positions",
+            f"`/holdings` — Current competition portfolio positions",
             f"`/news` — News cache summary with sentiment",
             f"`/history` — Portfolio value history (last 20)",
             f"`/chart` — Performance chart image",
+            f"`/trade` — Log a real buy/sell (ticker, buy/sell, shares, price)",
+            f"`/hold` — Confirm a HOLD recommendation (ticker)",
             f"`/help` — This message",
             f"",
             f"**Admin Commands** (Admin role only):",
             f"`/pause` — Pause the engine loop",
             f"`/resume` — Resume the engine loop",
             f"`/stop` — Gracefully stop the engine (preserves cache)",
-            f"`/clear` — Clear news cache and state files",
-            f"`/run_sandbox` — Trigger immediate SANDBOX cycle",
-            f"`/run_comp` — Trigger immediate COMPETITION cycle",
+            f"`/clear` — Clear news cache, state files, and competition ledger",
             f"",
             f"No role restrictions — all commands available to everyone.",
         ]

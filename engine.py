@@ -6,6 +6,7 @@ import datetime
 import re
 import random
 import threading
+import shutil
 import zoneinfo
 import requests
 import yfinance as yf
@@ -17,19 +18,54 @@ import matplotlib.dates as mdates
 
 from config import *
 
+from sentiment import score_headline
+
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def load_news_cache():
     if os.path.exists(NEWS_CACHE_FILE):
         with open(NEWS_CACHE_FILE, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and "headlines" in data:
+            tickers_seen = set(h.get("ticker") for h in data["headlines"])
+            if len(tickers_seen) < 3 and os.path.exists(NEWS_CACHE_BACKUP):
+                print(f"  [Cache] Main cache has only {len(tickers_seen)} ticker(s); restoring from backup.")
+                with open(NEWS_CACHE_BACKUP, "r") as f:
+                    data = json.load(f)
+        return data
+    if os.path.exists(NEWS_CACHE_BACKUP):
+        print(f"  [Cache] Main cache missing; restoring from backup.")
+        with open(NEWS_CACHE_BACKUP, "r") as f:
             return json.load(f)
     return {"headlines": []}
 
 
 def save_news_cache(cache):
+    if isinstance(cache, dict) and "headlines" in cache:
+        tickers_seen = set(h.get("ticker") for h in cache["headlines"])
+        if len(tickers_seen) >= len(TICKERS) * 0.5:
+            if os.path.exists(NEWS_CACHE_FILE):
+                shutil.copy2(NEWS_CACHE_FILE, NEWS_CACHE_BACKUP)
     with open(NEWS_CACHE_FILE, "w") as f:
         json.dump(cache, f, indent=2)
+
+
+def repair_news_cache(cache):
+    fixed = 0
+    for h in cache["headlines"]:
+        text = h.get("text", "")
+        net, pos, neg = score_headline(text)
+        old_net = h.get("net_score", 0)
+        if abs(old_net - net) > 0.001:
+            h["net_score"] = round(net, 4)
+            h["pos_count"] = round(pos, 4)
+            h["neg_count"] = round(neg, 4)
+            h["critical_neg"] = 0
+            fixed += 1
+    if fixed:
+        print(f"  [Cache] Repaired {fixed} headline(s) with FinBERT scores.")
+    return fixed
 
 
 def get_cache_window_hours():
@@ -67,6 +103,7 @@ def compute_rolling_sentiment(entries, ticker, window_hours=None):
     ]
     if not ticker_entries:
         return 0.0, 0, 0, 0
+    name = TICKER_NAMES.get(ticker, "").lower()
     total_weight = 0.0
     weighted_net = 0.0
     weighted_pos = 0.0
@@ -75,6 +112,18 @@ def compute_rolling_sentiment(entries, ticker, window_hours=None):
         age = now - datetime.datetime.fromisoformat(h["timestamp"])
         age_hours = age.total_seconds() / 3600
         weight = 0.5 ** (age_hours / DECAY_HALF_LIFE_HOURS)
+        hl = h["text"].lower()
+        relevance = 1.0
+        if ticker.lower() in hl:
+            relevance = 3.0
+        elif name and any(w in hl for w in name.split()):
+            relevance = 2.0
+        else:
+            relevance = 0.33
+        weight *= relevance
+        critical = h.get("critical_neg", 0)
+        if critical > 0:
+            weight *= (1 + critical)
         total_weight += weight
         weighted_net += h["net_score"] * weight
         weighted_pos += h["pos_count"] * weight
@@ -82,6 +131,8 @@ def compute_rolling_sentiment(entries, ticker, window_hours=None):
     avg_net = weighted_net / total_weight if total_weight > 0 else 0.0
     return avg_net, round(weighted_pos), round(weighted_neg), len(ticker_entries)
 
+
+# ── message state helpers ────────────────────────────────────────────────
 
 def load_message_state():
     if os.path.exists(MESSAGE_STATE_FILE):
@@ -107,16 +158,16 @@ def save_news_message_state(message_id):
         f.write(message_id.strip())
 
 
-def load_observation_state():
-    if os.path.exists(OBSERVATION_FILE):
-        with open(OBSERVATION_FILE, "r") as f:
-            return json.load(f)
-    return {"clock_state": "LOCKED", "observation_start": None, "price_log": {}}
+def load_comp_message_state():
+    if os.path.exists(COMPETITION_MESSAGE_STATE):
+        with open(COMPETITION_MESSAGE_STATE, "r") as f:
+            return f.read().strip()
+    return None
 
 
-def save_observation_state(state):
-    with open(OBSERVATION_FILE, "w") as f:
-        json.dump(state, f, indent=2)
+def save_comp_message_state(message_id):
+    with open(COMPETITION_MESSAGE_STATE, "w") as f:
+        f.write(message_id.strip())
 
 
 # ── market helpers ────────────────────────────────────────────────────────
@@ -194,71 +245,65 @@ def release_news_lock():
         os.remove(NEWS_LOCK_FILE)
 
 
-# ── sandbox helpers ───────────────────────────────────────────────────────
+# ── competition ledger ────────────────────────────────────────────────────
 
-def load_sandbox_ledger():
-    if os.path.exists(SANDBOX_LEDGER):
-        with open(SANDBOX_LEDGER, "r") as f:
+def load_competition_ledger():
+    if os.path.exists(COMPETITION_LEDGER):
+        with open(COMPETITION_LEDGER, "r") as f:
             return json.load(f)
     return {"cash_balance": STARTING_CAPITAL, "holdings": {}, "history": []}
 
 
-def save_sandbox_ledger(ledger):
-    with open(SANDBOX_LEDGER, "w") as f:
+def save_competition_ledger(ledger):
+    with open(COMPETITION_LEDGER, "w") as f:
         json.dump(ledger, f, indent=2)
 
 
-def collect_spot_prices(state, tickers):
-    now = datetime.datetime.now(datetime.timezone.utc)
-    if "price_log" not in state:
-        state["price_log"] = {}
-    for ticker in tickers:
-        if ticker not in state["price_log"]:
-            state["price_log"][ticker] = []
-        try:
-            stock = yf.Ticker(ticker)
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else None
-            if price and price > 0:
-                state["price_log"][ticker].append({"t": now.isoformat(), "p": price})
-                if len(state["price_log"][ticker]) > 10:
-                    state["price_log"][ticker] = state["price_log"][ticker][-10:]
-        except Exception:
-            pass
+def record_trade(ticker, action, shares, price):
+    ledger = load_competition_ledger()
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if action == "buy":
+        if ticker in ledger["holdings"]:
+            pos = ledger["holdings"][ticker]
+            total_cost = pos["shares"] * pos["avg_price"] + shares * price
+            pos["shares"] += shares
+            pos["avg_price"] = total_cost / pos["shares"]
+        else:
+            ledger["holdings"][ticker] = {"shares": shares, "avg_price": price}
+        ledger["cash_balance"] -= shares * price
+    elif action == "sell":
+        if ticker not in ledger["holdings"]:
+            return False
+        pos = ledger["holdings"][ticker]
+        if shares >= pos["shares"]:
+            del ledger["holdings"][ticker]
+        else:
+            pos["shares"] -= shares
+        ledger["cash_balance"] += shares * price
+    total_holdings_value = 0
+    for t, p in ledger["holdings"].items():
+        cp = _get_price(t)
+        total_holdings_value += p["shares"] * cp
+    portfolio_value = ledger["cash_balance"] + total_holdings_value
+    ledger["history"].append({
+        "timestamp": now,
+        "portfolio_value": round(portfolio_value, 2),
+        "event": f"{action.upper()} {shares} {ticker} @ ${price:.2f}",
+    })
+    save_competition_ledger(ledger)
+    generate_competition_chart(ledger)
+    return True
 
 
-def compute_volatility_spread(price_log):
-    spreads = []
-    for ticker, prices in price_log.items():
-        if len(prices) < 2:
-            continue
-        recent = [p["p"] for p in prices[-VOLATILITY_WINDOW:]]
-        if len(recent) < 2:
-            continue
-        returns = [(recent[i] - recent[i-1]) / recent[i-1] for i in range(1, len(recent))]
-        if not returns:
-            continue
-        mean = sum(returns) / len(returns)
-        variance = sum((r - mean) ** 2 for r in returns) / len(returns)
-        spreads.append(math.sqrt(variance))
-    if not spreads:
-        return float('inf')
-    return sum(spreads) / len(spreads)
-
-
-def volatility_stabilized(state):
-    if state.get("clock_state") != "OBSERVING":
-        return False
-    obs_start = datetime.datetime.fromisoformat(state["observation_start"])
-    elapsed = datetime.datetime.now(datetime.timezone.utc) - obs_start
-    if elapsed < datetime.timedelta(minutes=WARMUP_MINUTES):
-        return False
-    if elapsed >= datetime.timedelta(minutes=GRACE_MINUTES):
-        return True
-    spread = compute_volatility_spread(state.get("price_log", {}))
-    return spread < VOLATILITY_THRESHOLD
+def record_hold(ticker):
+    ledger = load_competition_ledger()
+    if ticker in ledger["holdings"]:
+        if "confirmed_holds" not in ledger:
+            ledger["confirmed_holds"] = []
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        ledger["confirmed_holds"].append({"ticker": ticker, "timestamp": now})
+        save_competition_ledger(ledger)
+    return True
 
 
 # ── webhook helpers ──────────────────────────────────────────────────────
@@ -293,15 +338,15 @@ def send_webhook_payload(payload, label, image_path=None):
         print(f"\n  [Team Desk] {label} transmission failed - {e}.")
 
 
-def send_or_update_dashboard(payload, image_path=None):
+def send_or_update_comp_dashboard(payload, image_path=None):
     webhook_url = os.environ.get("WEBHOOK_URL", "")
     if not webhook_url:
-        print(f"\n  [Discord Sync] Webhook URL not configured.")
+        print(f"\n  [Comp Dash] Webhook URL not configured.")
         return
-    existing_id = load_message_state()
+    existing_id = load_comp_message_state()
     wh_id, wh_token = parse_webhook_parts(webhook_url)
     if not wh_id or not wh_token:
-        print(f"\n  [Discord Sync] Could not parse webhook URL.")
+        print(f"\n  [Comp Dash] Could not parse webhook URL.")
         return
     try:
         if existing_id:
@@ -317,7 +362,7 @@ def send_or_update_dashboard(payload, image_path=None):
             else:
                 resp = requests.patch(edit_url, json={"content": payload}, timeout=15)
             resp.raise_for_status()
-            print(f"\n  [Discord Sync] Dynamic dashboard message ID [{existing_id}] successfully edited in place at 1-minute interval.")
+            print(f"\n  [Comp Dash] Dashboard message ID [{existing_id}] edited.")
         else:
             post_url = webhook_url.rstrip("/") + "?wait=true"
             if image_path and os.path.exists(image_path):
@@ -333,19 +378,37 @@ def send_or_update_dashboard(payload, image_path=None):
             resp.raise_for_status()
             new_id = resp.json().get("id")
             if new_id:
-                save_message_state(new_id)
-                print(f"\n  [Discord Sync] Initial dashboard message ID [{new_id}] posted and saved.")
+                save_comp_message_state(new_id)
+                print(f"\n  [Comp Dash] Initial dashboard message ID [{new_id}] posted and saved.")
             else:
-                print(f"\n  [Discord Sync] Dashboard posted but no message ID returned.")
+                print(f"\n  [Comp Dash] Dashboard posted but no message ID returned.")
     except Exception as e:
-        print(f"\n  [Discord Sync] Dashboard transmission failed - {e}.")
+        print(f"\n  [Comp Dash] Transmission failed - {e}.")
         if existing_id and getattr(getattr(e, "response", None), "status_code", None) == 404:
-            print(f"  [Discord Sync] PATCH failed (404) — clearing stale dashboard message ID.")
+            print(f"  [Comp Dash] PATCH failed (404) — clearing stale ID, re-POSTing.")
             try:
-                os.remove(MESSAGE_STATE_FILE)
+                os.remove(COMPETITION_MESSAGE_STATE)
             except Exception:
                 pass
-        return # Return so next cycle posts a new message
+            try:
+                post_url = webhook_url.rstrip("/") + "?wait=true"
+                if image_path and os.path.exists(image_path):
+                    with open(image_path, "rb") as f:
+                        resp2 = requests.post(
+                            post_url,
+                            data={"content": payload},
+                            files={"file": (os.path.basename(image_path), f, "image/png")},
+                            timeout=15
+                        )
+                else:
+                    resp2 = requests.post(post_url, json={"content": payload}, timeout=15)
+                resp2.raise_for_status()
+                new_id2 = resp2.json().get("id")
+                if new_id2:
+                    save_comp_message_state(new_id2)
+                    print(f"  [Comp Dash] Re-POSTed new dashboard message ID [{new_id2}].")
+            except Exception as e2:
+                print(f"  [Comp Dash] Re-POST also failed - {e2}.")
 
 
 def send_batched_news(alerts, et_now):
@@ -394,33 +457,23 @@ def send_batched_news(alerts, et_now):
         except Exception:
             pass
         if existing_id and getattr(getattr(e, "response", None), "status_code", None) == 404:
-            print(f"  [News Roundup] PATCH failed (404) — clearing stale message ID.")
+            print(f"  [News Roundup] PATCH failed (404) — clearing stale message ID, re-POSTing.")
             try:
                 os.remove(NEWS_MESSAGE_STATE_FILE)
             except Exception:
                 pass
+            try:
+                post_url = webhook_url.rstrip("/") + "?wait=true"
+                resp2 = requests.post(post_url, json={"content": payload}, timeout=15)
+                resp2.raise_for_status()
+                msg_id2 = resp2.json().get("id")
+                if msg_id2:
+                    save_news_message_state(msg_id2)
+                    print(f"  [News Roundup] Re-POSTed new message ID [{msg_id2}] ({len(alerts)} tickers).")
+            except Exception as e2:
+                print(f"  [News Roundup] Re-POST also failed - {e2}.")
         elif existing_id:
             print(f"  [News Roundup] PATCH failed — keeping message ID (retry next cycle).")
-
-
-# ── news flash ────────────────────────────────────────────────────────────
-
-def send_news_flash(r):
-    ticker = r["ticker"]
-    headline = r.get("top_headline", "No headlines available.")
-    sent = r["sentiment"]
-    rp = r["rolling_pos"]
-    rn = r["rolling_neg"]
-    rc = r["rolling_count"]
-    directive = r.get("directive", "Insufficient data for directive.")
-    lines = []
-    lines.append(f"NEWS [{ticker}] Real-Time Market Feed Alert")
-    lines.append(f"")
-    lines.append(f"  Headline Scanned: \"{headline}\"")
-    lines.append(f"  Rolling Sentiment: Score: {sent:+.2f} (24h Window: {rp} Pos, {rn} Neg across {rc} unique articles)")
-    lines.append(f"  System Directive: {directive}")
-    payload = "\n".join(lines)
-    send_webhook_payload(payload, f"News Flash - {ticker}")
 
 
 # ── summarizers / builders ───────────────────────────────────────────────
@@ -435,19 +488,14 @@ def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_n
     best_h = headlines[0]
     best_score = -1.0
     for h in headlines:
+        net, _, _ = score_headline(h)
         hl = h.lower()
-        tokens = re.findall(r"[a-z]+", hl)
-        pos = sum(1 for t in tokens if t in POSITIVE_LEXICON)
-        neg = sum(1 for t in tokens if t in NEGATIVE_LEXICON)
-        total = pos + neg
-        net = (pos - neg) / total if total > 0 else 0.0
         relevance = 1.0
         if ticker.lower() in hl:
             relevance = 3.0
         elif name and any(w in hl for w in name.split()):
             relevance = 2.0
-        critical_neg = sum(1 for t in tokens if t in CRITICAL_NEGATIVE_LEXICON)
-        score = abs(net) + relevance + critical_neg * 2.0
+        score = abs(net) + relevance
         if score > best_score:
             best_score = score
             best_h = h
@@ -464,7 +512,7 @@ def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_n
 
 def build_news_roundup(alerts, et_now):
     pt_now = et_now.astimezone(zoneinfo.ZoneInfo("US/Pacific"))
-    pt_time = pt_now.strftime('%I:%M %p').lstrip('0')  # 12-hour, e.g. "12:10 AM"
+    pt_time = pt_now.strftime('%I:%M %p').lstrip('0')
     lines = []
     lines.append("=" * 80)
     lines.append("                         GLASSBOX NEWS ROUNDUP")
@@ -479,73 +527,67 @@ def build_news_roundup(alerts, et_now):
         )
         lines.append(f"  {row}")
     lines.append("=" * 80)
-    lines.append(f"  {len(alerts)} headlines  |  24h Rolling Window  |  7d Trend Anchor")
+    lines.append(f"  {len(alerts)} headlines  |  24h Rolling Window  |  21d Trend Anchor")
     lines.append("=" * 80)
     return "\n".join(lines)
 
 
-def build_master_payload(results, market_state, et_now, total_tickers, clock_state=None):
-    ranked = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
-    top = ranked[:MAX_PORTFOLIO_HOLDINGS]
-    total_score = sum(r["adjusted_score"] for r in top) if top else 1
-    n_passing = len(ranked)
-    n_holding = len(top)
-    lines = []
-    lines.append("**Glassbox Finance - MASTER EXECUTION REPORT**")
-    if clock_state:
-        lines.append(f"Status: {market_state} — Clock: {clock_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
-    else:
-        lines.append(f"Status: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
-    lines.append(f"Scanner: {WATCHLIST_SCANNER_LIMIT} tickers | Passed: {n_passing} | Funded: {n_holding}")
-    lines.append(f"Capital: ${STARTING_CAPITAL:,}")
-    lines.append("")
-    lines.append("```")
-    header = f"{'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'$ Amt':>12} {'Shares':>8}"
-    lines.append(header)
-    lines.append("-" * len(header))
-    for r in top:
-        score = r["adjusted_score"]
-        pct = score / total_score * 100
-        dollar_alloc = STARTING_CAPITAL * (pct / 100)
-        try:
-            stock = yf.Ticker(r["ticker"])
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else 0
-        except Exception:
-            price = 0
-        target_shares = int(dollar_alloc / price) if price and price > 0 else 0
-        sent_label = f"{r['sentiment']:+.3f}"
-        lines.append(f"{r['ticker']:<8} {r['status']:<22} {sent_label:>10} {pct:>9.2f}% ${dollar_alloc:>9,.2f} {target_shares:>7}")
-    lines.append("-" * len(header))
-    lines.append(f"{'TOTAL':<8} {'':<22} {'':>10} {'100.00%':>10} ${STARTING_CAPITAL:>9,.2f} {'':>7}")
-    lines.append("```")
-    return "\n".join(lines)
-
-
-def build_sandbox_status(ledger, clock_state, market_state, et_now):
+def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, has_final_recs=False):
     pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL
     change = pv - STARTING_CAPITAL
     pct = (change / STARTING_CAPITAL) * 100
     arrow = "+" if change >= 0 else ""
     lines = []
-    lines.append(f"**Glassbox Finance — SANDBOX DASHBOARD**")
-    lines.append(f"Status: {market_state} — Clock: {clock_state}  |  {et_now.strftime('%H:%M UTC')}")
-    lines.append(f"Scanner: {WATCHLIST_SCANNER_LIMIT} tickers | Holdings: {len(ledger['holdings'])} / {MAX_PORTFOLIO_HOLDINGS}")
-    lines.append(f"Portfolio: ${pv:,.2f}  ({arrow}{change:,.2f} / {arrow}{pct:.2f}%)")
-    lines.append(f"Cash: ${ledger['cash_balance']:,.2f}")
-    last = ledger["history"][-1] if ledger["history"] else {}
-    if last.get("realized_pnl"):
-        rp = last["realized_pnl"]
-        rp_arrow = "+" if rp >= 0 else ""
-        lines.append(f"Realized P&L: {rp_arrow}${rp:,.2f}")
+    lines.append(f"**Glassbox Finance — COMPETITION DASHBOARD**")
+    lines.append(f"Market: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
+    lines.append(f"Portfolio: **${pv:,.2f}** ({arrow}{change:,.2f} / {arrow}{pct:.2f}%)")
+    lines.append(f"Cash: ${ledger['cash_balance']:,.2f}  |  Holdings: {len(ledger['holdings'])} / {MAX_PORTFOLIO_HOLDINGS}")
+    lines.append("")
+    if ledger["holdings"]:
+        lines.append("**Real Holdings:**")
+        lines.append("```")
+        lines.append(f"{'Ticker':<8} {'Shares':>7} {'Avg Price':>11} {'Current':>9} {'Value':>12} {'P&L':>12}")
+        lines.append("-" * 59)
+        total_val = 0
+        total_cost = 0
+        for t, pos in sorted(ledger["holdings"].items()):
+            cp = _get_price(t)
+            val = pos["shares"] * cp
+            cost = pos["shares"] * pos["avg_price"]
+            pnl = val - cost
+            pnl_s = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
+            total_val += val
+            total_cost += cost
+            lines.append(f"{t:<8} {pos['shares']:>7} ${pos['avg_price']:>9,.2f} ${cp:>7,.2f} ${val:>9,.2f} ${pnl_s:>10}")
+        lines.append("-" * 59)
+        lines.append(f"{'TOTAL':<8} {'':>7} {'':>11} {'':>9} ${total_val:>9,.2f} ${total_cost - total_val:>+9,.2f}")
+        lines.append("```")
+    lines.append("")
+    lines.append("**Predicted Allocation (next rebalance):**")
+    lines.append("```")
+    lines.append(f"{'Ticker':<8} {'Score':>8} {'Sentiment':>10} {'Fund':>8} {'Decision':>10} {'Target Shares':>14}")
+    lines.append("-" * 60)
+    rec_map = {rec["ticker"]: rec for rec in recs}
+    for r in predicted:
+        ticker = r["ticker"]
+        score = r["adjusted_score"]
+        fund = r["health_score"]
+        sent = r["sentiment"]
+        rec = rec_map.get(ticker, {})
+        action = rec.get("action", "?")
+        shares = rec.get("target_shares", 0)
+        lines.append(f"{ticker:<8} {score:>7.1f} {sent:>+9.3f} {fund:>7.1f} {action:>10} {shares:>13}")
+    lines.append("-" * 60)
+    lines.append("```")
+    if has_final_recs:
+        execute_by = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES))
+        lines.append("")
+        lines.append(f"**EXECUTE BY {execute_by.strftime('%H:%M UTC')}**")
+        for rec in recs:
+            if rec["action"] in ("BUY", "SELL"):
+                lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']} price:{rec['price']:.2f}`")
+        lines.append(f"`/hold` for any HOLD positions to confirm")
     return "\n".join(lines)
-
-
-def send_master_report(results, market_state, et_now, total_tickers, image_path=None):
-    payload = build_master_payload(results, market_state, et_now, total_tickers)
-    send_webhook_payload(payload, "Master Execution Report", image_path=image_path)
 
 
 # ── validation ────────────────────────────────────────────────────────────
@@ -584,10 +626,7 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
         short_sent, short_pos, short_neg, short_count = compute_rolling_sentiment(entries, ticker)
         long_sent, long_pos, long_neg, long_count = compute_rolling_sentiment(entries, ticker, window_hours=LONG_WINDOW_HOURS)
         blended = (1 - LONG_SENTIMENT_WEIGHT) * short_sent + LONG_SENTIMENT_WEIGHT * long_sent
-        penalty = 1.0
-        if blended < 0.0:
-            penalty = 1.0 + (blended * 0.3)
-            penalty = max(0.70, penalty)
+        penalty = max(0.70, min(1.30, 1.0 + blended * SENTIMENT_IMPACT))
         return short_sent, penalty, [], short_pos, short_neg, short_count, long_sent, long_pos, long_neg, long_count
     try:
         news_raw = stock.news
@@ -595,19 +634,13 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
         short_sent, short_pos, short_neg, short_count = compute_rolling_sentiment(entries, ticker)
         long_sent, long_pos, long_neg, long_count = compute_rolling_sentiment(entries, ticker, window_hours=LONG_WINDOW_HOURS)
         blended = (1 - LONG_SENTIMENT_WEIGHT) * short_sent + LONG_SENTIMENT_WEIGHT * long_sent
-        penalty = 1.0
-        if blended < 0.0:
-            penalty = 1.0 + (blended * 0.3)
-            penalty = max(0.70, penalty)
+        penalty = max(0.70, min(1.30, 1.0 + blended * SENTIMENT_IMPACT))
         return short_sent, penalty, [], short_pos, short_neg, short_count, long_sent, long_pos, long_neg, long_count
     if not news_raw:
         short_sent, short_pos, short_neg, short_count = compute_rolling_sentiment(entries, ticker)
         long_sent, long_pos, long_neg, long_count = compute_rolling_sentiment(entries, ticker, window_hours=LONG_WINDOW_HOURS)
         blended = (1 - LONG_SENTIMENT_WEIGHT) * short_sent + LONG_SENTIMENT_WEIGHT * long_sent
-        penalty = 1.0
-        if blended < 0.0:
-            penalty = 1.0 + (blended * 0.3)
-            penalty = max(0.70, penalty)
+        penalty = max(0.70, min(1.30, 1.0 + blended * SENTIMENT_IMPACT))
         return short_sent, penalty, [], short_pos, short_neg, short_count, long_sent, long_pos, long_neg, long_count
     latest_headlines = []
     new_count = 0
@@ -623,31 +656,23 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
         )
         if already_seen:
             continue
-        tokens = re.findall(r"[a-z]+", title.lower())
-        pos = sum(1 for t in tokens if t in POSITIVE_LEXICON)
-        neg = sum(1 for t in tokens if t in NEGATIVE_LEXICON)
-        critical = sum(1 for t in tokens if t in CRITICAL_NEGATIVE_LEXICON)
-        total = pos + neg + critical
-        net = (pos - neg - critical) / total if total > 0 else 0.0
-        net = max(-1.0, min(1.0, net))
+        net, pos_prob, neg_prob = score_headline(title)
         news_cache["headlines"].append({
             "text": title,
             "ticker": ticker,
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "pos_count": pos,
-            "neg_count": neg,
-            "net_score": net,
+            "pos_count": round(pos_prob, 4),
+            "neg_count": round(neg_prob, 4),
+            "critical_neg": 0,
+            "net_score": round(net, 4),
         })
         new_count += 1
     short_sent, short_pos, short_neg, short_count = compute_rolling_sentiment(entries, ticker)
     long_sent, long_pos, long_neg, long_count = compute_rolling_sentiment(entries, ticker, window_hours=LONG_WINDOW_HOURS)
     blended = (1 - LONG_SENTIMENT_WEIGHT) * short_sent + LONG_SENTIMENT_WEIGHT * long_sent
-    penalty = 1.0
-    if blended < 0.0:
-        penalty = 1.0 + (blended * 0.3)
-        penalty = max(0.70, penalty)
+    penalty = max(0.70, min(1.30, 1.0 + blended * SENTIMENT_IMPACT))
     if new_count > 0:
-        print(f"  [{ticker}] Cached {new_count} new headline(s) | Short: {short_sent:+.3f} | 7d: {long_sent:+.3f} | Blended: {blended:+.3f}")
+        print(f"  [{ticker}] Cached {new_count} new headline(s) | Short: {short_sent:+.3f} | 21d: {long_sent:+.3f} | Blended: {blended:+.3f}")
     return short_sent, penalty, latest_headlines, short_pos, short_neg, short_count, long_sent, long_pos, long_neg, long_count
 
 
@@ -688,12 +713,51 @@ def process_ticker(ticker, index, total, news_cache):
                 directive = f"[MOCK ACTION] Would REJECT (CR={cr:.2f}, D/E={dte:.2f})."
         else:
             directive = f"[MOCK ACTION] Would PASS Solvency and BUY shares."
+    info = stock.info
+    roe = info.get("returnOnEquity")
+    if roe and roe > 0:
+        roe_factor = max(0.5, min(1.5, roe / 0.20))
+    else:
+        roe_factor = 1.0
+    if ticker in INSTITUTIONAL_BANKS:
+        pb = info.get("priceToBook")
+        if pb and pb > 0:
+            if pb < 0.8:
+                pb_factor = 0.8
+            elif 0.8 <= pb < 1.0:
+                pb_factor = 0.9
+            elif 1.0 <= pb <= 1.5:
+                pb_factor = 1.0
+            elif 1.5 < pb <= 2.0:
+                pb_factor = 0.9
+            else:
+                pb_factor = 0.85
+        else:
+            pb_factor = 1.0
+        valuation_multiplier = roe_factor * 0.7 + pb_factor * 0.3
+    else:
+        pe = info.get("trailingPE") or info.get("forwardPE")
+        if pe and pe > 0:
+            if pe < 5:
+                pe_factor = 0.7
+            elif 5 <= pe < 10:
+                pe_factor = 0.9
+            elif 10 <= pe <= 20:
+                pe_factor = 1.0
+            elif 20 < pe <= 40:
+                pe_factor = 0.9
+            else:
+                pe_factor = 0.8
+        else:
+            pe_factor = 1.0
+        valuation_multiplier = roe_factor * 0.5 + pe_factor * 0.5
+    health_score = health_score * valuation_multiplier
     net_sentiment, penalty, headlines, rolling_pos, rolling_neg, rolling_count, long_sent, long_pos, long_neg, long_count = sentiment_gate(stock, ticker, news_cache, skip_fetch=True)
     if solvency_ok and net_sentiment < 0.0:
         print(f"  [{index}/{total}] [Semantic Analysis]: Computational linguistics detect high rhetorical negative sentiment across public news sources, indicating structural headline risk that down-weights our core fundamental asset valuation.")
     adjusted_score = (health_score * penalty) if solvency_ok else health_score
     status = "PASS (Bank Neutral)" if ticker in INSTITUTIONAL_BANKS else ("PASS" if solvency_ok else "FAIL")
-    print(f"  [{index}/{total}] {ticker} {status} (Score: {adjusted_score:.1f}/100)")
+    print(f"  [{index}/{total}] {ticker} {status} (Score: {adjusted_score:.1f}/100, ValMult: {valuation_multiplier:.3f})")
     return {
         "ticker": ticker,
         "passed": solvency_ok,
@@ -705,6 +769,7 @@ def process_ticker(ticker, index, total, news_cache):
         "sentiment": net_sentiment,
         "penalty": penalty,
         "adjusted_score": adjusted_score,
+        "valuation_multiplier": valuation_multiplier,
         "top_headline": headlines[0] if headlines else "No headlines available.",
         "headlines": headlines,
         "rolling_pos": rolling_pos,
@@ -717,100 +782,7 @@ def process_ticker(ticker, index, total, news_cache):
     }
 
 
-# ── display ──────────────────────────────────────────────────────────────
-
-def display_portfolio_table(results):
-    if not results:
-        print(f"\n{'='*80}")
-        print(f"  PORTFOLIO DASHBOARD")
-        print(f"{'='*80}")
-        print(f"  No tickers passed all gates. Portfolio is empty.")
-        print(f"  [Scanner] {WATCHLIST_SCANNER_LIMIT} tickers evaluated, 0 passed.")
-        print(f"{'='*80}")
-        return
-    ranked = sorted(results, key=lambda x: x["adjusted_score"], reverse=True)
-    top = ranked[:MAX_PORTFOLIO_HOLDINGS]
-    n_passing = len(ranked)
-    n_holding = len(top)
-    total_score = sum(r["adjusted_score"] for r in top)
-    print(f"\n{'='*90}")
-    print(f"  PORTFOLIO DASHBOARD — Allocation of ${STARTING_CAPITAL:,}")
-    print(f"  [Scanner] {WATCHLIST_SCANNER_LIMIT} evaluated | {n_passing} passed | Top {n_holding} funded")
-    print(f"{'='*90}")
-    header = f"  {'Ticker':<8} {'Status':<22} {'Sentiment':>10} {'Alloc %':>10} {'$ Amt':>12} {'Shares':>8}"
-    print(header)
-    print(f"  {'------':<8} {'----------------------':<22} {'----------':>10} {'----------':>10} {'-----------':>12} {'-------':>8}")
-    for r in top:
-        ticker = r["ticker"]
-        status = r["status"]
-        sent = r["sentiment"]
-        score = r["adjusted_score"]
-        pct = score / total_score * 100 if total_score > 0 else 0
-        dollar_alloc = STARTING_CAPITAL * (pct / 100)
-        try:
-            stock = yf.Ticker(ticker)
-            price = stock.fast_info.last_price
-            if price is None or price <= 0:
-                hist = stock.history(period="1d")
-                price = hist["Close"].iloc[-1] if not hist.empty else 0
-        except Exception:
-            price = 0
-        if price and price > 0:
-            target_shares = int(dollar_alloc / price)
-        else:
-            target_shares = 0
-        sent_label = f"{sent:+.3f}"
-        print(f"  {ticker:<8} {status:<22} {sent_label:>10} {pct:>9.2f}% ${dollar_alloc:>9,.2f} {target_shares:>7}")
-    print(f"  {'------':<8} {'----------------------':<22} {'----------':>10} {'----------':>10} {'-----------':>12} {'-------':>8}")
-    print(f"  {'TOTAL':<8} {'':<22} {'':>10} {'100.00%':>10} ${STARTING_CAPITAL:>9,.2f} {'':>7}")
-    print(f"{'='*90}")
-
-
-# ── visualization ────────────────────────────────────────────────────────
-
-def visualization_update():
-    ledger = load_sandbox_ledger()
-    total_holdings_value = 0
-    for ticker, pos in ledger["holdings"].items():
-        price = _get_price(ticker)
-        total_holdings_value += pos["shares"] * price
-    portfolio_value = ledger["cash_balance"] + total_holdings_value
-    ledger["history"].append({
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "portfolio_value": round(portfolio_value, 2),
-    })
-    save_sandbox_ledger(ledger)
-    generate_portfolio_chart(ledger)
-    return ledger
-
-
-def generate_portfolio_chart(ledger):
-    history = ledger.get("history", [])
-    if len(history) < 2:
-        print(f"\n  {'='*70}")
-        print(f"  PORTFOLIO GROWTH CHART")
-        print(f"{'='*70}")
-        print(f"  Not enough data points to render trend (need 2+ runs).")
-        return
-    timestamps = [datetime.datetime.fromisoformat(h["timestamp"]) for h in history]
-    values = [h["portfolio_value"] for h in history]
-    plt.figure(figsize=(12, 6), facecolor='#0d0d1a')
-    ax = plt.gca()
-    ax.set_facecolor('#1a1a2e')
-    ax.plot(timestamps, values, color='#00ff88', linewidth=2.5, label='Net Worth')
-    ax.axhline(y=STARTING_CAPITAL, color='#555555', linewidth=1.5, linestyle='--', label=f'Baseline ${STARTING_CAPITAL:,}')
-    ax.set_title('Sandbox Portfolio Performance', fontsize=16, fontweight='bold', color='white', pad=15)
-    ax.set_xlabel('Time (UTC)', fontsize=12, color='white')
-    ax.set_ylabel('Portfolio Value ($)', fontsize=12, color='white')
-    ax.legend(loc='upper left', fontsize=11)
-    ax.grid(True, alpha=0.3, color='#888888')
-    ax.tick_params(colors='white')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    plt.tight_layout()
-    plt.savefig(SANDBOX_CHART, dpi=150)
-    plt.close()
-    print(f"  [Chart] {SANDBOX_CHART} saved ({len(history)} data points).")
-
+# ── chart ────────────────────────────────────────────────────────────────
 
 def _get_price(ticker):
     try:
@@ -824,98 +796,135 @@ def _get_price(ticker):
         return 0
 
 
-def sandbox_execute(ranked, total_score):
-    ledger = load_sandbox_ledger()
-    new_tickers = {r["ticker"] for r in ranked}
+def generate_competition_chart(ledger):
+    history = ledger.get("history", [])
+    if len(history) < 2:
+        print(f"\n  {'='*70}")
+        print(f"  COMPETITION PORTFOLIO CHART")
+        print(f"{'='*70}")
+        print(f"  Not enough data points to render trend (need 2+ runs).")
+        return
+    timestamps = [datetime.datetime.fromisoformat(h["timestamp"]) for h in history]
+    values = [h["portfolio_value"] for h in history]
+    plt.figure(figsize=(12, 6), facecolor='#0d0d1a')
+    ax = plt.gca()
+    ax.set_facecolor('#1a1a2e')
+    ax.plot(timestamps, values, color='#00ff88', linewidth=2.5, label='Net Worth')
+    ax.axhline(y=STARTING_CAPITAL, color='#555555', linewidth=1.5, linestyle='--', label=f'Baseline ${STARTING_CAPITAL:,}')
+    ax.set_title('Competition Portfolio Performance', fontsize=16, fontweight='bold', color='white', pad=15)
+    ax.set_xlabel('Time (UTC)', fontsize=12, color='white')
+    ax.set_ylabel('Portfolio Value ($)', fontsize=12, color='white')
+    ax.legend(loc='upper left', fontsize=11)
+    ax.grid(True, alpha=0.3, color='#888888')
+    ax.tick_params(colors='white')
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
+    plt.tight_layout()
+    plt.savefig(COMPETITION_CHART, dpi=150)
+    plt.close()
+    print(f"  [Chart] {COMPETITION_CHART} saved ({len(history)} data points).")
 
-    print(f"\n{'='*80}")
-    print(f"  SANDBOX EXECUTION — Portfolio Rebalance (Sell / Hold / Buy)")
-    print(f"{'='*80}")
-    print(f"  Cash:           ${ledger['cash_balance']:>10,.2f}")
-    print(f"  Current Holdings: {len(ledger['holdings'])} positions")
-    print(f"{'='*80}")
 
-    realized_pnl = 0.0
+# ── full evaluation ──────────────────────────────────────────────────────
 
-    # Phase 1: SELL — exit held positions not in new allocation
-    for ticker in list(ledger["holdings"].keys()):
-        if ticker in new_tickers:
-            continue
-        pos = ledger["holdings"][ticker]
-        price = _get_price(ticker)
-        if price and price > 0:
-            proceeds = pos["shares"] * price
-            cost_basis = pos["shares"] * pos["avg_price"]
-            pnl = proceeds - cost_basis
-            realized_pnl += pnl
-            ledger["cash_balance"] += proceeds
-            del ledger["holdings"][ticker]
-            print(f"  SELL  {pos['shares']} shares of {ticker} @ ${price:.2f}  (P&L: ${pnl:+,.2f})")
-        else:
-            print(f"  SELL  {pos['shares']} shares of {ticker} @ price N/A — skipped.")
+def run_full_evaluation(news_cache):
+    passed_results = []
+    for i, ticker in enumerate(TICKERS, start=1):
+        try:
+            result = process_ticker(ticker, i, len(TICKERS), news_cache)
+            if result is not None and result["passed"]:
+                passed_results.append(result)
+        except Exception as e:
+            print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
+    save_news_cache(news_cache)
+    predicted = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)[:MAX_PORTFOLIO_HOLDINGS]
+    return predicted
 
-    # Phase 2: HOLD — report existing positions that stay
-    for ticker in sorted(new_tickers):
-        if ticker in ledger["holdings"]:
-            pos = ledger["holdings"][ticker]
+
+def compute_recommendations(predicted, ledger):
+    eligible = [r for r in predicted if r.get("sentiment", 0) >= 0]
+    eligible_tickers = {r["ticker"] for r in eligible}
+    cash = ledger["cash_balance"]
+    recs = []
+
+    buy_candidates = eligible[:MAX_BUYS_PER_CYCLE]
+    total_score = sum(r["adjusted_score"] for r in buy_candidates)
+
+    if total_score > 0:
+        raw_weights = {r["ticker"]: r["adjusted_score"] / total_score for r in buy_candidates}
+        capped = {}
+        excess = 0.0
+        for t, w in raw_weights.items():
+            if w > MAX_POSITION_WEIGHT:
+                capped[t] = MAX_POSITION_WEIGHT
+                excess += w - MAX_POSITION_WEIGHT
+            else:
+                capped[t] = w
+        if excess > 0:
+            uncapped = {t: w for t, w in raw_weights.items() if raw_weights[t] < MAX_POSITION_WEIGHT}
+            uncapped_total = sum(uncapped.values())
+            if uncapped_total > 0:
+                for t in uncapped:
+                    capped[t] += excess * (raw_weights[t] / uncapped_total)
+
+        for r in buy_candidates:
+            ticker = r["ticker"]
             price = _get_price(ticker)
-            val = pos["shares"] * price if price else 0
-            print(f"  HOLD  {pos['shares']} shares of {ticker} @ ${price:.2f}  (Value: ${val:,.2f})")
+            alloc = cash * capped[ticker]
+            target_shares = int(alloc / price) if price and price > 0 else 0
+            recs.append({"ticker": ticker, "action": "BUY", "target_shares": target_shares, "price": price})
 
-    # Phase 3: BUY — new positions only
-    buy_targets = [r for r in ranked if r["ticker"] not in ledger["holdings"]]
-    buy_total_score = sum(r["adjusted_score"] for r in buy_targets) or 1
-    for r in buy_targets:
+    for r in eligible[MAX_BUYS_PER_CYCLE:]:
         ticker = r["ticker"]
-        pct = r["adjusted_score"] / buy_total_score * 100
-        dollar_alloc = ledger["cash_balance"] * (pct / 100)
-        price = _get_price(ticker)
-        if price and price > 0:
-            target_shares = int(dollar_alloc / price)
-            if target_shares > 0:
-                cost = target_shares * price
-                ledger["holdings"][ticker] = {"shares": target_shares, "avg_price": price}
-                ledger["cash_balance"] -= cost
-                print(f"  BUY   {target_shares} shares of {ticker} @ ${price:.2f}  (${cost:,.2f})")
+        if ticker in ledger["holdings"]:
+            price = _get_price(ticker)
+            recs.append({"ticker": ticker, "action": "HOLD", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
 
-    # Valuate
+    for ticker in list(ledger["holdings"].keys()):
+        if ticker not in eligible_tickers:
+            price = _get_price(ticker)
+            recs.append({"ticker": ticker, "action": "SELL", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
+
+    buy_tickers = {r["ticker"] for r in buy_candidates}
+    held_tickers = set(ledger["holdings"].keys())
+    display_list = list(buy_candidates)
+    for r in predicted:
+        if r["ticker"] in held_tickers and r["ticker"] not in buy_tickers:
+            display_list.append(r)
+    return recs, display_list
+
+
+# ── viz update ───────────────────────────────────────────────────────────
+
+def visualization_update():
+    ledger = load_competition_ledger()
     total_holdings_value = 0
     for ticker, pos in ledger["holdings"].items():
         price = _get_price(ticker)
-        total_holdings_value += pos["shares"] * (price if price else 0)
-
+        total_holdings_value += pos["shares"] * price
     portfolio_value = ledger["cash_balance"] + total_holdings_value
-    entry = {
+    ledger["history"].append({
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "portfolio_value": round(portfolio_value, 2),
-    }
-    if realized_pnl != 0:
-        entry["realized_pnl"] = round(realized_pnl, 2)
-    ledger["history"].append(entry)
-    save_sandbox_ledger(ledger)
-
-    print(f"\n  Portfolio Summary:")
-    print(f"  Cash:      ${ledger['cash_balance']:>10,.2f}")
-    print(f"  Holdings:  ${total_holdings_value:>10,.2f}")
-    print(f"  Total:     ${portfolio_value:>10,.2f}")
-    if realized_pnl != 0:
-        print(f"  Realized:  ${realized_pnl:>+10,.2f}")
-    generate_portfolio_chart(ledger)
+    })
+    save_competition_ledger(ledger)
+    generate_competition_chart(ledger)
+    return ledger
 
 
 # ── reset ────────────────────────────────────────────────────────────────
 
 def handle_reset():
     state_files = [
-        GATE_FILE, NEWS_CACHE_FILE, OBSERVATION_FILE,
+        GATE_FILE, NEWS_CACHE_FILE,
         MESSAGE_STATE_FILE, NEWS_MESSAGE_STATE_FILE,
-        NEWS_CYCLE_FILE, NEWS_LOCK_FILE
+        NEWS_CYCLE_FILE, NEWS_LOCK_FILE,
+        COMPETITION_LEDGER, COMPETITION_MESSAGE_STATE, COMPETITION_PREDICTION_FILE,
     ]
     statuses = {}
     for path in state_files:
         name = os.path.basename(path)
         if os.path.exists(path):
-            if name in (os.path.basename(MESSAGE_STATE_FILE), os.path.basename(NEWS_MESSAGE_STATE_FILE)):
+            if name in (os.path.basename(MESSAGE_STATE_FILE), os.path.basename(NEWS_MESSAGE_STATE_FILE), os.path.basename(COMPETITION_MESSAGE_STATE)):
                 stored_id = ""
                 with open(path, "r") as f:
                     stored_id = f.read().strip()
@@ -934,6 +943,9 @@ def handle_reset():
             statuses[name] = "deleted"
         else:
             statuses[name] = "not found"
+    if os.path.exists(COMPETITION_CHART):
+        os.remove(COMPETITION_CHART)
+        statuses[os.path.basename(COMPETITION_CHART)] = "deleted"
     PIPELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PIPELINE.md")
     if os.path.exists(PIPELINE_PATH):
         with open(PIPELINE_PATH, "r", encoding="utf-8") as f:
@@ -987,7 +999,7 @@ def run_news_stream(news_cache, et_now):
                 "long_rolling_count": lc,
             })
             if headlines:
-                print(f"  [News] {ticker} ({i}/{total}) — {len(headlines)} new | Short: {sent:+.3f} | 7d: {ls:+.3f}")
+                print(f"  [News] {ticker} ({i}/{total}) — {len(headlines)} new | Short: {sent:+.3f} | 21d: {ls:+.3f}")
         except Exception as e:
             print(f"  [News] {ticker} ({i}/{total}) ERROR — {e}")
         if i < total:
@@ -1009,7 +1021,6 @@ class EngineRunner:
         self._thread = None
         self.status = {
             "mode": run_mode,
-            "clock_state": "LOCKED",
             "market_state": "ANALYTICAL_OFF_HOURS",
             "last_run_utc": None,
             "uptime_start_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -1071,17 +1082,22 @@ class EngineRunner:
 
     def _run_loop(self):
         print(f"\n{'='*80}")
-        print(f"  GLASSBOX FINANCE — Three-Clock Architecture")
+        print(f"  GLASSBOX FINANCE — Competition Engine")
         print(f"  Mode: {self.run_mode}  |  Watchlist: {WATCHLIST_SCANNER_LIMIT} tickers  |  Max Holdings: {MAX_PORTFOLIO_HOLDINGS}")
         print(f"{'='*80}")
 
         news_cache = load_news_cache()
         release_news_lock()
+        repair_news_cache(news_cache)
+
+        last_viz_time = 0.0
+        news_just_fetched_this_cycle = False
 
         while not self._stopped.is_set():
             self._paused.wait()
 
             cycle_start = datetime.datetime.now(datetime.timezone.utc)
+            now_ts = cycle_start.timestamp()
 
             pruned, window_hours = prune_news_cache(news_cache)
             if pruned > 0:
@@ -1090,124 +1106,61 @@ class EngineRunner:
             market_state, et_now = check_market_clock()
             self._update_status(market_state=market_state)
 
+            # ── Clock 1: 60-min news cycle + full eval ──
             if check_news_cycle():
                 if acquire_news_lock():
                     try:
                         run_news_stream(news_cache, et_now)
                         mark_news_cycle()
                         self._update_status(news_last_run=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                        news_just_fetched_this_cycle = True
                     finally:
                         release_news_lock()
 
-            if self.run_mode == "COMPETITION":
+            # Re-run full evaluation after news cycle so predicted allocation reflects latest sentiment
+            if news_just_fetched_this_cycle:
+                print(f"\n  [Eval] Running full ticker evaluation (sentiment updated)...")
+                predicted = run_full_evaluation(news_cache)
+                if predicted:
+                    with open(COMPETITION_PREDICTION_FILE, "w") as f:
+                        json.dump(predicted, f, indent=2)
+                news_just_fetched_this_cycle = False
+
+                # Compare predicted vs real ledger
+                ledger = load_competition_ledger()
+                recs, display = compute_recommendations(predicted, ledger)
                 daily_allowed = check_daily_gate()
-                if daily_allowed and market_state == "MARKET_OPEN":
-                    news_alerts = []
-                    passed_results = []
-                    for i, ticker in enumerate(TICKERS, start=1):
-                        try:
-                            result = process_ticker(ticker, i, len(TICKERS), news_cache)
-                            if result is not None:
-                                news_alerts.append(result)
-                                if result["passed"]:
-                                    passed_results.append(result)
-                        except Exception as e:
-                            print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
-                    save_news_cache(news_cache)
-                    clipped = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)[:MAX_PORTFOLIO_HOLDINGS]
-                    display_portfolio_table(clipped)
-                    send_master_report(clipped, market_state, et_now, len(TICKERS))
+                has_final_recs = daily_allowed and market_state == "MARKET_OPEN"
+
+                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=has_final_recs)
+
+                if has_final_recs:
                     mark_daily_allocation()
                     self._update_status(last_run_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
-                    print(f"  [Gate] Daily allocation executed and timestamped.")
+                    print(f"  [Gate] Daily allocation window opened — recommendations issued.")
                 else:
-                    if not daily_allowed:
-                        print(f"  [Gate] 24h cooldown active — skipped.")
-                    if market_state != "MARKET_OPEN":
-                        print(f"  [Gate] Outside NYSE hours — skipped.")
-                print(f"\n  Next cycle +{LOOP_INTERVAL_MINUTES}min.")
-                self._sleep_with_trigger(LOOP_INTERVAL_MINUTES * 60)
-                self.clear_trigger()
-                continue
+                    gate_status = "cooldown" if not daily_allowed else "waiting for market open"
+                    print(f"  [Gate] Prediction updated — gate {gate_status}.")
 
+                send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
 
+                print(f"\n  Next full cycle +{LOOP_INTERVAL_MINUTES}min.")
+                last_viz_time = 0.0
 
-            daily_allowed = check_daily_gate()
-            obs_state = load_observation_state()
-            clock_label = obs_state.get("clock_state", "LOCKED")
-            self._update_status(clock_state=clock_label)
-
-            print(f"\n  [{cycle_start.strftime('%H:%M UTC')}] {market_state}  |  24-Hour Gate: {'EXPIRED' if daily_allowed else 'LOCKED'}  |  Observation Clock: {clock_label}")
-            print(f"  {'='*80}")
-
-            if daily_allowed and clock_label == "LOCKED":
-                obs_state["clock_state"] = "OBSERVING"
-                obs_state["observation_start"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-                obs_state["price_log"] = {}
-                save_observation_state(obs_state)
-                collect_spot_prices(obs_state, TICKERS)
-                save_observation_state(obs_state)
-                ledger = visualization_update()
-                self._update_status(clock_state="OBSERVING", holdings_count=len(ledger["holdings"]), portfolio_value=ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL)
-                payload = build_sandbox_status(ledger, "OBSERVING INTRA-DAY VOLATILITY", market_state, et_now)
-                send_or_update_dashboard(payload, image_path=SANDBOX_CHART if os.path.exists(SANDBOX_CHART) else None)
-                print(f"  [Smart Trigger] Entering observation state — collecting volatility data.")
-
-            elif clock_label == "OBSERVING":
-                collect_spot_prices(obs_state, TICKERS)
-                save_observation_state(obs_state)
-                if volatility_stabilized(obs_state):
-                    print(f"  [DEBUG] Market state before rebalance check: {market_state}")
-                    if market_state == "MARKET_OPEN":
-                        print(f"  [Smart Trigger]: Market volatility stabilized. Executing daily portfolio rebalance and locking decision gate for 24 hours.")
-                        news_alerts = []
-                        passed_results = []
-                        for i, ticker in enumerate(TICKERS, start=1):
-                            try:
-                                result = process_ticker(ticker, i, len(TICKERS), news_cache)
-                                if result is not None:
-                                    news_alerts.append(result)
-                                    if result["passed"]:
-                                        passed_results.append(result)
-                            except Exception as e:
-                                print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
-                        save_news_cache(news_cache)
-                        clipped = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)[:MAX_PORTFOLIO_HOLDINGS]
-                        total_score = sum(r["adjusted_score"] for r in clipped) if clipped else 1
-                        sandbox_execute(clipped, total_score)
-                        mark_daily_allocation()
-                        obs_state["clock_state"] = "LOCKED"
-                        obs_state["price_log"] = {}
-                        save_observation_state(obs_state)
-                        ledger = load_sandbox_ledger()
-                        self._update_status(clock_state="LOCKED", last_run_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), holdings_count=len(ledger["holdings"]), portfolio_value=ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL)
-                        payload = build_sandbox_status(ledger, "LOCKED", market_state, et_now)
-                        send_or_update_dashboard(payload, image_path=SANDBOX_CHART)
-                    else:
-                        print(f"  [Smart Trigger]: Volatility stabilized, but market is {market_state} — skipping portfolio rebalance.")
-                        mark_daily_allocation()
-                        obs_state["clock_state"] = "LOCKED"
-                        obs_state["price_log"] = {}
-                        save_observation_state(obs_state)
-                        ledger = load_sandbox_ledger()
-                        self._update_status(clock_state="LOCKED", last_run_utc=datetime.datetime.now(datetime.timezone.utc).isoformat(), holdings_count=len(ledger["holdings"]), portfolio_value=ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL)
-                        payload = build_sandbox_status(ledger, "LOCKED", market_state, et_now)
-                        send_or_update_dashboard(payload, image_path=SANDBOX_CHART)
-                else:
-                    ledger = visualization_update()
-                    spread = compute_volatility_spread(obs_state.get("price_log", {}))
-                    elapsed_min = (datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(obs_state["observation_start"])).total_seconds() / 60
-                    phase = f"WARMUP ({elapsed_min:.0f}/{WARMUP_MINUTES} min)" if elapsed_min < WARMUP_MINUTES else f"SPREAD {spread:.6f} < {VOLATILITY_THRESHOLD}"
-                    print(f"  [Volatility] {phase}  |  Hard cap: {GRACE_MINUTES} min  |  Waiting.")
-                    payload = build_sandbox_status(ledger, "OBSERVING INTRA-DAY VOLATILITY", market_state, et_now)
-                    send_or_update_dashboard(payload, image_path=SANDBOX_CHART if os.path.exists(SANDBOX_CHART) else None)
-            else:
+            # ── Clock 3: 60-second visualization ──
+            if now_ts - last_viz_time >= 60:
+                last_viz_time = now_ts
                 ledger = visualization_update()
                 self._update_status(holdings_count=len(ledger["holdings"]), portfolio_value=ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL)
-                payload = build_sandbox_status(ledger, "UPDATING REAL-TIME VALUE", market_state, et_now)
-                send_or_update_dashboard(payload, image_path=SANDBOX_CHART if os.path.exists(SANDBOX_CHART) else None)
 
-            print(f"  [Next] +60s.")
-            print(f"  {'='*80}")
-            self._sleep_with_trigger(60)
+                # Rebuild dashboard with latest ledger data + stored prediction
+                predicted = []
+                if os.path.exists(COMPETITION_PREDICTION_FILE):
+                    with open(COMPETITION_PREDICTION_FILE, "r") as f:
+                        predicted = json.load(f)
+                recs, display = compute_recommendations(predicted, ledger) if predicted else ([], [])
+                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now)
+                send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
+
+            self._sleep_with_trigger(5)
             self.clear_trigger()

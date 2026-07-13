@@ -221,8 +221,8 @@ class QueryCog(commands.Cog):
 
     @app_commands.command(name="trade", description="Log a real trade for the competition ledger")
     @app_commands.check(trader_check)
-    async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int, price: float):
-        from engine import record_trade, load_competition_ledger
+    async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int):
+        from engine import record_trade, load_competition_ledger, _get_price
         ticker = ticker.upper()
         action = action.lower()
         if action not in ("buy", "sell"):
@@ -231,8 +231,9 @@ class QueryCog(commands.Cog):
         if shares <= 0:
             await interaction.response.send_message("Shares must be positive.", ephemeral=True)
             return
-        if price <= 0:
-            await interaction.response.send_message("Price must be positive.", ephemeral=True)
+        price = _get_price(ticker)
+        if price is None or price <= 0:
+            await interaction.response.send_message(f"Could not fetch live price for {ticker}.", ephemeral=True)
             return
         ok = record_trade(ticker, action, shares, price)
         if not ok:
@@ -266,7 +267,7 @@ class QueryCog(commands.Cog):
             f"`/news` — News cache summary with sentiment",
             f"`/history` — Portfolio value history (last 20)",
             f"`/chart` — Performance chart image",
-            f"`/trade` — Log a real buy/sell (ticker, buy/sell, shares, price)",
+            f"`/trade` — Log a real buy/sell (ticker, buy/sell, shares — price fetched live)",
             f"`/hold` — Confirm a HOLD recommendation (ticker)",
             f"`/help` — This message",
             f"",

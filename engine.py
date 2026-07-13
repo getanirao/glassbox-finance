@@ -121,11 +121,14 @@ def compute_rolling_sentiment(entries, ticker, window_hours=None):
         else:
             relevance = 0.33
         weight *= relevance
+        net_score = h["net_score"]
+        if net_score < 0 and relevance >= 1.0:
+            weight *= 1 + (abs(net_score) * DOWNSIDE_SENTIMENT_WEIGHT)
         critical = h.get("critical_neg", 0)
         if critical > 0:
             weight *= (1 + critical)
         total_weight += weight
-        weighted_net += h["net_score"] * weight
+        weighted_net += net_score * weight
         weighted_pos += h["pos_count"] * weight
         weighted_neg += h["neg_count"] * weight
     avg_net = weighted_net / total_weight if total_weight > 0 else 0.0
@@ -176,9 +179,15 @@ def check_market_clock():
     eastern = zoneinfo.ZoneInfo("US/Eastern")
     now = datetime.datetime.now(eastern)
     weekday = now.weekday()
+    today = now.date().isoformat()
     current_time_minutes = now.hour * 60 + now.minute
     open_minutes = 9 * 60 + 30
     close_minutes = 16 * 60
+    if today in NYSE_FULL_DAY_CLOSURES_2026:
+        return "ANALYTICAL_OFF_HOURS", now
+    if today in NYSE_EARLY_CLOSES_2026:
+        hour, minute = NYSE_EARLY_CLOSES_2026[today].split(":")
+        close_minutes = int(hour) * 60 + int(minute)
     if weekday < 5 and open_minutes <= current_time_minutes < close_minutes:
         return "MARKET_OPEN", now
     return "ANALYTICAL_OFF_HOURS", now
@@ -840,6 +849,34 @@ def run_full_evaluation(news_cache):
     return predicted
 
 
+def capped_score_weights(candidates):
+    if not candidates:
+        return {}
+    weights = {r["ticker"]: 0.0 for r in candidates}
+    remaining = list(candidates)
+    remaining_weight = 1.0
+    while remaining and remaining_weight > 0:
+        total_score = sum(max(r["adjusted_score"], 0) for r in remaining)
+        if total_score <= 0:
+            equal_weight = remaining_weight / len(remaining)
+            for r in remaining:
+                weights[r["ticker"]] = min(MAX_POSITION_WEIGHT, equal_weight)
+            break
+        newly_capped = []
+        for r in remaining:
+            raw_weight = remaining_weight * max(r["adjusted_score"], 0) / total_score
+            if raw_weight > MAX_POSITION_WEIGHT:
+                weights[r["ticker"]] = MAX_POSITION_WEIGHT
+                newly_capped.append(r)
+        if not newly_capped:
+            for r in remaining:
+                weights[r["ticker"]] = remaining_weight * max(r["adjusted_score"], 0) / total_score
+            break
+        remaining = [r for r in remaining if r not in newly_capped]
+        remaining_weight -= MAX_POSITION_WEIGHT * len(newly_capped)
+    return weights
+
+
 def compute_recommendations(predicted, ledger):
     eligible = [r for r in predicted if r.get("sentiment", 0) >= 0]
     eligible_tickers = {r["ticker"] for r in eligible}
@@ -847,25 +884,8 @@ def compute_recommendations(predicted, ledger):
     recs = []
 
     buy_candidates = eligible[:MAX_BUYS_PER_CYCLE]
-    total_score = sum(r["adjusted_score"] for r in buy_candidates)
-
-    if total_score > 0:
-        raw_weights = {r["ticker"]: r["adjusted_score"] / total_score for r in buy_candidates}
-        capped = {}
-        excess = 0.0
-        for t, w in raw_weights.items():
-            if w > MAX_POSITION_WEIGHT:
-                capped[t] = MAX_POSITION_WEIGHT
-                excess += w - MAX_POSITION_WEIGHT
-            else:
-                capped[t] = w
-        if excess > 0:
-            uncapped = {t: w for t, w in raw_weights.items() if raw_weights[t] < MAX_POSITION_WEIGHT}
-            uncapped_total = sum(uncapped.values())
-            if uncapped_total > 0:
-                for t in uncapped:
-                    capped[t] += excess * (raw_weights[t] / uncapped_total)
-
+    capped = capped_score_weights(buy_candidates)
+    if capped:
         for r in buy_candidates:
             ticker = r["ticker"]
             price = _get_price(ticker)

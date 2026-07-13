@@ -14,8 +14,6 @@ sandbox_performance.png
 data/
 
 # Docker
-Dockerfile
-docker-compose.yml
 .dockerignore
 
 # Python

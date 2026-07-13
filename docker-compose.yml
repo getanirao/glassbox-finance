@@ -1,0 +1,24 @@
+services:
+  glassbox:
+    build: .
+    container_name: glassbox-finance
+    restart: unless-stopped
+    mem_limit: 512m
+    mem_reservation: 256m
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - WEBHOOK_URL=${WEBHOOK_URL}
+      - RUN_MODE=${RUN_MODE:-COMPETITION}
+      - MPLBACKEND=Agg
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - glassbox_data:/app/data
+    stop_grace_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  glassbox_data:

@@ -971,12 +971,16 @@ def compute_recommendations(predicted, ledger):
 
     buy_candidates = eligible[:MAX_BUYS_PER_CYCLE]
     capped = capped_score_weights(buy_candidates)
+    affordable_buy_tickers = set()
     if capped:
         for r in buy_candidates:
             ticker = r["ticker"]
             price = _get_price(ticker)
             alloc = cash * capped[ticker]
             target_shares = int(alloc / price) if price and price > 0 else 0
+            if target_shares == 0:
+                continue
+            affordable_buy_tickers.add(ticker)
             recs.append({"ticker": ticker, "action": "BUY", "target_shares": target_shares, "price": price})
 
     for r in eligible[MAX_BUYS_PER_CYCLE:]:
@@ -990,9 +994,16 @@ def compute_recommendations(predicted, ledger):
             price = _get_price(ticker)
             recs.append({"ticker": ticker, "action": "SELL", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
 
-    buy_tickers = {r["ticker"] for r in buy_candidates}
+    # HOLD for held tickers that are buy-eligible but unaffordable
+    for r in buy_candidates:
+        ticker = r["ticker"]
+        if ticker in ledger["holdings"] and ticker not in affordable_buy_tickers:
+            price = _get_price(ticker)
+            recs.append({"ticker": ticker, "action": "HOLD", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
+
+    buy_tickers = {r["ticker"] for r in recs if r["action"] == "BUY"}
     held_tickers = set(ledger["holdings"].keys())
-    display_list = list(buy_candidates)
+    display_list = [r for r in buy_candidates if r["ticker"] in buy_tickers]
     for r in predicted:
         if r["ticker"] in held_tickers and r["ticker"] not in buy_tickers:
             display_list.append(r)

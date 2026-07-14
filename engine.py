@@ -359,11 +359,7 @@ def record_trade(ticker, action, shares, price, trade_time=None):
         else:
             pos["shares"] -= shares
         ledger["cash_balance"] += shares * price
-    total_holdings_value = 0
-    for t, p in ledger["holdings"].items():
-        cp = _get_price(t)
-        total_holdings_value += p["shares"] * cp
-    portfolio_value = ledger["cash_balance"] + total_holdings_value
+    portfolio_value = ledger["cash_balance"] + _holdings_value(ledger)
     ledger["history"].append({
         "timestamp": ts,
         "portfolio_value": round(portfolio_value, 2),
@@ -630,7 +626,7 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
         total_val = 0
         total_cost = 0
         for t, pos in sorted(ledger["holdings"].items()):
-            cp = _get_price(t)
+            cp = _get_price(t) or pos["avg_price"]
             val = pos["shares"] * cp
             cost = pos["shares"] * pos["avg_price"]
             pnl = val - cost
@@ -886,14 +882,24 @@ def _get_price(ticker):
         price = stock.fast_info.last_price
         if price is None or price <= 0:
             hist = stock.history(period="1d")
-            price = hist["Close"].iloc[-1] if not hist.empty else 0
+            price = hist["Close"].iloc[-1] if not hist.empty else None
         return price
     except Exception:
-        return 0
+        return None
+
+
+def _holdings_value(ledger):
+    total = 0.0
+    for ticker, pos in ledger["holdings"].items():
+        price = _get_price(ticker)
+        if price is None or price <= 0:
+            price = pos["avg_price"]
+        total += pos["shares"] * price
+    return total
 
 
 def generate_competition_chart(ledger):
-    history = ledger.get("history", [])
+    history = sorted(ledger.get("history", []), key=lambda h: h["timestamp"])
     if len(history) < 2:
         print(f"\n  {'='*70}")
         print(f"  COMPETITION PORTFOLIO CHART")
@@ -1015,11 +1021,7 @@ def compute_recommendations(predicted, ledger):
 
 def visualization_update():
     ledger = load_competition_ledger()
-    total_holdings_value = 0
-    for ticker, pos in ledger["holdings"].items():
-        price = _get_price(ticker)
-        total_holdings_value += pos["shares"] * price
-    portfolio_value = ledger["cash_balance"] + total_holdings_value
+    portfolio_value = ledger["cash_balance"] + _holdings_value(ledger)
     ledger["history"].append({
         "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "portfolio_value": round(portfolio_value, 2),

@@ -660,11 +660,12 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
     lines.append("```")
     if has_final_recs:
         execute_by = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES))
+        ex_hhmm = execute_by.strftime("%H:%M")
         lines.append("")
-        lines.append(f"**EXECUTE BY {execute_by.strftime('%H:%M UTC')}**")
+        lines.append(f"**EXECUTE BY {ex_hhmm} UTC**")
         for rec in recs:
             if rec["action"] in ("BUY", "SELL"):
-                lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']} price:{rec['price']:.2f}`")
+                lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']} time:{ex_hhmm}`")
         lines.append(f"`/hold` for any HOLD positions to confirm")
     return "\n".join(lines)
 

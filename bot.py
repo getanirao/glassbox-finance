@@ -253,6 +253,49 @@ class QueryCog(commands.Cog):
         ]
         await interaction.followup.send("\n".join(lines), ephemeral=False)
 
+    @app_commands.command(name="bulk-trade", description="Execute multiple trades from a pasted block")
+    @app_commands.check(trader_check)
+    async def cmd_bulk_trade(self, interaction: discord.Interaction, block: str):
+        await interaction.response.defer()
+        from engine import record_trade, load_competition_ledger, _get_price
+        lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
+        results = []
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 3:
+                results.append(f"`{line}` — SKIP (need: TICKER ACTION SHARES [TIME])")
+                continue
+            ticker = parts[0].upper()
+            action = parts[1].lower()
+            try:
+                shares = int(parts[2])
+            except ValueError:
+                results.append(f"`{line}` — SKIP (invalid shares)")
+                continue
+            time_arg = parts[3] if len(parts) >= 4 else ""
+            if action not in ("buy", "sell") or shares <= 0:
+                results.append(f"`{line}` — SKIP (action must be buy/sell, shares > 0)")
+                continue
+            price = _get_price(ticker)
+            if price is None or price <= 0:
+                results.append(f"`{ticker} {action.upper()} {shares}` — SKIP (no price)")
+                continue
+            ok = record_trade(ticker, action, shares, price, trade_time=time_arg.strip() if time_arg.strip() else None)
+            if not ok:
+                results.append(f"`{ticker} SELL {shares}` — SKIP (not in ledger)")
+                continue
+            results.append(f"`{ticker} {action.upper()} {shares} @ ${price:.2f}` — OK")
+        ledger = load_competition_ledger()
+        pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else 0
+        out = [
+            f"**Bulk Trade Results**  |  Cash: ${ledger['cash_balance']:,.2f}  |  Portfolio: ${pv:,.2f}",
+            f"Holdings: {len(ledger['holdings'])} positions",
+            "```",
+            "\n".join(results),
+            "```",
+        ]
+        await interaction.followup.send("\n".join(out), ephemeral=False)
+
     @app_commands.command(name="hold", description="Confirm a HOLD recommendation from the engine")
     @app_commands.check(trader_check)
     async def cmd_hold(self, interaction: discord.Interaction, ticker: str):
@@ -273,6 +316,7 @@ class QueryCog(commands.Cog):
             f"`/history` — Portfolio value history (last 20)",
             f"`/chart` — Performance chart image",
             f"`/trade` — Log a real buy/sell (ticker, buy/sell, shares — price fetched live)",
+            f"`/bulk-trade` — Pasted block of trades (one `TICKER ACTION SHARES` per line)",
             f"`/hold` — Confirm a HOLD recommendation (ticker)",
             f"`/help` — This message",
             f"",

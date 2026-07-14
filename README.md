@@ -99,6 +99,7 @@ See `ORACLE_ALWAYS_FREE_SETUP.md` for the full OCI Ampere A1 bootstrap and `POST
 | `/history` | Last 20 portfolio value entries |
 | `/chart` | Latest competition chart image |
 | `/trade` | Log a trade: `ticker:CSCO action:buy shares:100 time:13:45` (optional `time` in HH:MM UTC, price fetched live) |
+| `/bulk-trade` | Multiple trades from pasted block: one `TICKER ACTION SHARES` per line |
 | `/hold` | Confirm a HOLD: `ticker:MSFT` |
 | `/help` | Command list |
 | `/pause` | Pause engine (Admin) |

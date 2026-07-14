@@ -20,6 +20,8 @@ from config import *
 
 from sentiment import score_headline
 
+NEWS_LOCK_OWNER = f"{os.getpid()}:{datetime.datetime.now(datetime.timezone.utc).isoformat()}"
+
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
@@ -237,12 +239,63 @@ def mark_news_cycle():
         f.write(datetime.datetime.now(datetime.timezone.utc).isoformat())
 
 
+def _read_news_lock():
+    if not os.path.exists(NEWS_LOCK_FILE):
+        return None
+    try:
+        with open(NEWS_LOCK_FILE, "r") as f:
+            raw = f.read().strip()
+    except OSError:
+        return None
+    if not raw:
+        return {"owner": None, "created_at": None}
+    try:
+        payload = json.loads(raw)
+        owner = payload.get("owner")
+        created_raw = payload.get("created_at")
+    except json.JSONDecodeError:
+        owner = None
+        created_raw = raw.splitlines()[0]
+    try:
+        created_at = datetime.datetime.fromisoformat(created_raw) if created_raw else None
+        if created_at and created_at.tzinfo is None:
+            created_at = created_at.replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        created_at = None
+    return {"owner": owner, "created_at": created_at}
+
+
+def release_stale_news_lock(max_age_minutes=NEWS_LOCK_STALE_MINUTES):
+    lock = _read_news_lock()
+    if not lock:
+        return False
+    created_at = lock.get("created_at")
+    is_stale = created_at is None
+    if created_at:
+        age = datetime.datetime.now(datetime.timezone.utc) - created_at
+        is_stale = age >= datetime.timedelta(minutes=max_age_minutes)
+    if not is_stale:
+        return False
+    try:
+        os.remove(NEWS_LOCK_FILE)
+        print("  [News] Removed stale lock before starting a new cycle.")
+        return True
+    except FileNotFoundError:
+        return False
+
+
 def acquire_news_lock():
     for attempt in range(5):
-        if not os.path.exists(NEWS_LOCK_FILE):
-            with open(NEWS_LOCK_FILE, "w") as f:
-                f.write(datetime.datetime.now(datetime.timezone.utc).isoformat())
+        try:
+            fd = os.open(NEWS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            with os.fdopen(fd, "w") as f:
+                json.dump({
+                    "owner": NEWS_LOCK_OWNER,
+                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                }, f)
             return True
+        except FileExistsError:
+            release_stale_news_lock()
         print(f"  [News] Lock held — retrying ({attempt + 1}/5)...")
         time.sleep(1)
     print("  [News] Could not acquire lock.")
@@ -250,8 +303,16 @@ def acquire_news_lock():
 
 
 def release_news_lock():
-    if os.path.exists(NEWS_LOCK_FILE):
+    lock = _read_news_lock()
+    if not lock:
+        return
+    owner = lock.get("owner")
+    if owner and owner != NEWS_LOCK_OWNER:
+        return
+    try:
         os.remove(NEWS_LOCK_FILE)
+    except FileNotFoundError:
+        pass
 
 
 # ── competition ledger ────────────────────────────────────────────────────
@@ -999,7 +1060,7 @@ def handle_reset():
 
 # ── news stream ──────────────────────────────────────────────────────────
 
-def run_news_stream(news_cache, et_now):
+def run_news_stream(news_cache, et_now, send_roundup=True):
     news_alerts = []
     total = len(TICKERS)
     for i, ticker in enumerate(TICKERS, start=1):
@@ -1025,8 +1086,36 @@ def run_news_stream(news_cache, et_now):
         if i < total:
             time.sleep(random.uniform(NEWS_RATE_MIN, NEWS_RATE_MAX))
     save_news_cache(news_cache)
-    send_batched_news(news_alerts, et_now)
+    if send_roundup:
+        send_batched_news(news_alerts, et_now)
+    else:
+        print("  [News] Roundup transmission skipped for worker-only mode.")
     print(f"  [News] Stream complete — {len(news_alerts)} tickers. Next cycle +60min.")
+
+
+def run_news_worker(once=False, send_roundup=False):
+    print(f"\n{'='*80}")
+    print(f"  GLASSBOX FINANCE — News Worker")
+    print(f"  Mode: {'one-shot' if once else 'continuous'}  |  Watchlist: {WATCHLIST_SCANNER_LIMIT} tickers")
+    print(f"{'='*80}")
+    news_cache = load_news_cache()
+    repair_news_cache(news_cache)
+    release_stale_news_lock()
+    while True:
+        _, et_now = check_market_clock()
+        if acquire_news_lock():
+            try:
+                pruned, window_hours = prune_news_cache(news_cache)
+                if pruned > 0:
+                    print(f"  [Cache] Pruned {pruned} headline(s) older than {window_hours}h window.")
+                run_news_stream(news_cache, et_now, send_roundup=send_roundup)
+                mark_news_cycle()
+            finally:
+                release_news_lock()
+        if once:
+            break
+        print(f"  [Worker] Sleeping {LOOP_INTERVAL_MINUTES}min before next fetch cycle.")
+        time.sleep(LOOP_INTERVAL_MINUTES * 60)
 
 
 # ── Engine Runner ────────────────────────────────────────────────────────
@@ -1107,7 +1196,7 @@ class EngineRunner:
         print(f"{'='*80}")
 
         news_cache = load_news_cache()
-        release_news_lock()
+        release_stale_news_lock()
         repair_news_cache(news_cache)
 
         last_viz_time = 0.0

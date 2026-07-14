@@ -24,6 +24,7 @@ MAX_PORTFOLIO_HOLDINGS = 12
 NEWS_CYCLE_HOURS = 1
 NEWS_RATE_MIN = 1.5
 NEWS_RATE_MAX = 3.5
+NEWS_LOCK_STALE_MINUTES = 90
 
 GATE_FILE = os.path.join(DATA_DIR, ".last_run")
 NEWS_CACHE_FILE = os.path.join(DATA_DIR, ".news_cache.json")

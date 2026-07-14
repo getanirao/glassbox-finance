@@ -1,0 +1,53 @@
+name: News Worker
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+jobs:
+  fetch-news:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: write
+    env:
+      RUN_MODE: COMPETITION
+      MPLBACKEND: Agg
+      PYTHONUNBUFFERED: "1"
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Restore local news cache
+        uses: actions/cache@v4
+        with:
+          path: data
+          key: news-cache-${{ github.run_id }}
+          restore-keys: |
+            news-cache-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run one news fetch cycle
+        run: python main.py --news-worker-once
+
+      - name: Upload cache snapshot for inspection
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: news-cache-${{ github.run_id }}
+          path: |
+            data/.news_cache.json
+            data/.news_cache.backup.json
+          if-no-files-found: ignore
+          retention-days: 7

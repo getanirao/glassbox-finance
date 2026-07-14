@@ -9,7 +9,7 @@ load_dotenv()
 os.environ["MPLBACKEND"] = "Agg"
 
 from config import DATA_DIR
-from engine import EngineRunner, handle_reset
+from engine import EngineRunner, handle_reset, run_news_worker
 
 
 def ensure_data_dir():
@@ -31,6 +31,12 @@ def parse_args():
                         help="Start Discord bot alongside engine")
     parser.add_argument("--bot-only", action="store_true",
                         help="Start only the Discord bot, no engine")
+    parser.add_argument("--engine", action="store_true",
+                        help="Start only the recommendation engine")
+    parser.add_argument("--news-worker", action="store_true",
+                        help="Continuously fetch and score news without Discord or recommendations")
+    parser.add_argument("--news-worker-once", action="store_true",
+                        help="Run one fetch/score news cycle and exit")
     parser.add_argument("--token", type=str, default=None,
                         help="Discord bot token (overrides BOT_TOKEN env)")
     return parser.parse_args()
@@ -47,6 +53,13 @@ def main():
     if args.sandbox and args.comp:
         print("  Error: --sandbox and --comp are mutually exclusive.")
         sys.exit(1)
+    if (args.news_worker or args.news_worker_once) and (args.bot or args.bot_only or args.engine):
+        print("  Error: news-worker modes cannot be combined with --bot, --bot-only, or --engine.")
+        sys.exit(1)
+
+    if args.news_worker or args.news_worker_once:
+        run_news_worker(once=args.news_worker_once, send_roundup=False)
+        sys.exit(0)
 
     from config import RUN_MODE_FILE
     if args.sandbox:
@@ -58,15 +71,17 @@ def main():
     else:
         run_mode = os.environ.get("RUN_MODE", "COMPETITION")
 
-    if not args.sandbox and not args.comp and not args.bot and not args.bot_only:
+    if not args.sandbox and not args.comp and not args.bot and not args.bot_only and not args.engine:
         print("\n  Glassbox Finance — Wolves of Wall Street")
         print("  " + "-" * 50)
-        print("  Usage: python main.py [--sandbox | --comp] [--bot | --bot-only] [--clear]")
+        print("  Usage: python main.py [--comp] [--bot | --bot-only | --engine | --news-worker | --news-worker-once] [--clear]")
         print()
-        print("  --sandbox    Paper trading with 1-min visualization")
         print("  --comp       Competition advisory desk (default)")
         print("  --bot        Start Discord bot + engine")
         print("  --bot-only   Start only the Discord bot")
+        print("  --engine     Start only the recommendation engine")
+        print("  --news-worker       Continuously fetch and score news only")
+        print("  --news-worker-once  Fetch and score news once, then exit")
         print("  --clear      Purge state files")
         print("  " + "-" * 50 + "\n")
         if not args.bot and not args.bot_only:

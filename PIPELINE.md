@@ -1,3 +1,22 @@
+### Entry 33 — 2026-07-13T11:56:00Z
+
+**Action:** Prepared Oracle Always Free ARM deployment and news-worker roles.
+
+**Changes:**
+- Reworked `Dockerfile` for multi-platform/ARM deployment: Python 3.12, `BUILDPLATFORM` model stage, `TARGETPLATFORM` runtime awareness, and opt-in FinBERT export via `EXPORT_FINBERT=1`.
+- Updated `docker-compose.yml` for Oracle Ampere defaults (`DOCKER_PLATFORM=linux/arm64`), persistent `glassbox_data`, memory knobs, and an optional `worker` profile for local news-only workers.
+- Added `--engine`, `--news-worker`, and `--news-worker-once` CLI roles in `main.py`.
+- Added `run_news_worker()` and `send_roundup=False` support so workers fetch/score news without Discord dashboards or recommendations.
+- Hardened the local news lock with atomic file creation, owner tokens, and stale-lock cleanup for same-volume engine/worker coordination.
+- Added scheduled/manual GitHub Actions workflow `.github/workflows/news-worker.yml` to run `--news-worker-once` and preserve cache artifacts until shared storage is wired.
+- Added root setup/handoff docs: `ORACLE_ALWAYS_FREE_SETUP.md` and `POSTGRES_STORAGE_HANDOFF.md`.
+
+**Logic:** Oracle Ampere A1 is the always-on host for bot + recommendation engine. Worker roles leave room for future distributed cache builders without duplicate Discord posts. FinBERT export is opt-in to avoid PyTorch build pressure on ARM free-tier hosts; the existing LM fallback remains available.
+
+**Files Touched:** `Dockerfile`, `docker-compose.yml`, `.env.example`, `.github/workflows/news-worker.yml`, `config.py`, `main.py`, `engine.py`, `README.md`, `PIPELINE.md`, `ORACLE_ALWAYS_FREE_SETUP.md`, `POSTGRES_STORAGE_HANDOFF.md`
+
+---
+
 ### Entry 32 — 2026-07-13T11:35:00Z
 
 **Action:** Fixed sentiment alignment for ticker-relevant downside headlines, enforced capped RR sizing, and added the 2026 NYSE holiday calendar.

@@ -37,3 +37,7 @@ env/
 # OS
 .DS_Store
 Thumbs.db
+
+# Fine-tuning artifacts
+finetune_*.txt
+tmp_checkpoints/

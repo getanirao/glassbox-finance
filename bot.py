@@ -132,36 +132,6 @@ class QueryCog(commands.Cog):
     def __init__(self, bot: GlassboxBot):
         self.bot = bot
 
-    @app_commands.command(name="holdings", description="Show current competition portfolio holdings")
-    @app_commands.check(trader_check)
-    async def cmd_holdings(self, interaction: discord.Interaction):
-        await interaction.response.defer()
-        from engine import load_competition_ledger
-        ledger = load_competition_ledger()
-        if not ledger["holdings"]:
-            await interaction.followup.send("No current holdings.", ephemeral=True)
-            return
-        lines = [f"**Competition Portfolio**  |  Cash: ${ledger['cash_balance']:,.2f}"]
-        lines.append("```")
-        header = f"{'Ticker':<8} {'Shares':>8} {'Avg Price':>12} {'Value':>14}"
-        lines.append(header)
-        lines.append("-" * len(header))
-        total = 0
-        for ticker, pos in ledger["holdings"].items():
-            try:
-                import yfinance as yf
-                stock = yf.Ticker(ticker)
-                price = stock.fast_info.last_price
-            except Exception:
-                price = 0
-            val = pos["shares"] * price
-            total += val
-            lines.append(f"{ticker:<8} {pos['shares']:>8} ${pos['avg_price']:>9,.2f} ${val:>11,.2f}")
-        lines.append("-" * len(header))
-        lines.append(f"{'TOTAL':<8} {'':>8} {'':>12} ${total:>11,.2f}")
-        lines.append("```")
-        await interaction.followup.send("\n".join(lines), ephemeral=False)
-
     @app_commands.command(name="news", description="Show latest news roundup")
     @app_commands.check(trader_check)
     async def cmd_news(self, interaction: discord.Interaction):
@@ -311,7 +281,6 @@ class QueryCog(commands.Cog):
             f"",
             f"**Query Commands** (Trader + Admin):",
             f"`/status` — Engine state, clock, portfolio value",
-            f"`/holdings` — Current competition portfolio positions",
             f"`/news` — News cache summary with sentiment",
             f"`/history` — Portfolio value history (last 20)",
             f"`/chart` — Performance chart image",

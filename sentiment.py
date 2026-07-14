@@ -21,6 +21,7 @@ class FinBERTScorer:
         self._tokenizer = None
         self._pos_idx = 2
         self._neg_idx = 0
+        self._using_lm = False
 
     def _ensure_loaded(self):
         if self._session is not None:
@@ -53,6 +54,10 @@ class FinBERTScorer:
             print(f"[sentiment] ONNX load failed: {exc}")
             self._session = False
 
+    @property
+    def using_lm(self):
+        return self._using_lm
+
     def score(self, headline):
         """Return (net_score, pos_prob, neg_prob).
 
@@ -65,6 +70,7 @@ class FinBERTScorer:
         return _apply_business_risk_floor(headline, *self._score_lm(headline))
 
     def _score_onnx(self, headline):
+        self._using_lm = False
         inputs = self._tokenizer(
             headline,
             return_tensors="np",
@@ -83,6 +89,7 @@ class FinBERTScorer:
         return (pos - neg, pos, neg)
 
     def _score_lm(self, headline):
+        self._using_lm = True
         from config import POSITIVE_LEXICON, NEGATIVE_LEXICON, CRITICAL_NEGATIVE_LEXICON
         words = re.findall(r"[a-z]+", headline.lower())
         tokens = [w for w in words if len(w) > 1]

@@ -4,11 +4,11 @@ Quantitative finance engine providing real-time sentiment-driven BUY/HOLD/SELL r
 
 ## Current System Status
 
-- **Live Financial Data Ingestion Active via yfinance** — Pulls raw income statements, balance sheets, and cash flow statements for all 75 tickers every 60-min news cycle.
+- **Live Financial Data Ingestion Active via yfinance** — Fundamental data (income statements, balance sheets, valuation ratios) cached for 24 hours to avoid Yahoo rate limits. News headlines and sentiment still fetched every 60-min cycle. Sentiment and price data stream at full frequency.
 - **Solvency Screening Engine Live** — `evaluate_solvency()` computes Current Ratio and Debt-to-Equity Ratio from live balance-sheet data. Assets with CR < 1.2 or D/E > 1.5 are rejected. Financial institutions (JPM, GS, BAC, MS, C) skip solvency gates with a neutral baseline score of 75.0.
 - **ROE + P/E (P/B for Banks) Valuation Multiplier Active** — After solvency, `health_score` is multiplied by a blended factor: 50/50 ROE+P/E for non-banks, 70/30 ROE+P/B for banks. ROE normalized to 20% par (cap 0.5–1.5×). P/E sweet spot 10–20×; P/B sweet spot 1.0–1.5×. Prevents overvaluing high-ROE expensive stocks.
 - **24-Hour Time Cooldown Gate Active** — Final BUY/HOLD/SELL recommendations issued at most once per 24 hours during NYSE market open. Predicted allocation re-computed every 60-min news cycle regardless of gate or market state.
-- **FinBERT Sentiment Scoring (ONNX Quantized)** — `ProsusAI/finbert` can be exported to INT8 ONNX at Docker build time with `EXPORT_FINBERT=1`; runtime inference uses `onnxruntime` when the model exists. Temperature scaling (T=0.5) applied to logits before softmax to sharpen compressed 3-class scores. Loughran-McDonald lexicon (2,744 words) remains the default offline fallback.
+- **FinBERT Sentiment Scoring (ONNX Quantized)** — `ProsusAI/finbert` can be exported to INT8 ONNX at Docker build time with `EXPORT_FINBERT=1`; runtime inference uses `onnxruntime` when the model exists. Temperature scaling (T=0.5) applied to logits before softmax to sharpen compressed 3-class scores. Loughran-McDonald lexicon (2,744 words) remains the offline fallback, with an automatic `⚠️ SENTIMENT ENGINE DEGRADED` alert on the Discord dashboard when active.
 - **75-Ticker Watchlist Scanner Active** — Broad-market universe across Technology, Healthcare, Energy, Consumer Cyclical, Industrials, Utilities, and Finance. Top 12 per cycle by blended solvency + sentiment score.
 - **Manual System Reset Gate Available** — Running `python main.py --clear` wipes news cache, competition ledger, gate timestamp, deletes both Discord dashboard and news roundup messages from channel history, and resets PIPELINE.md log entries.
 - **BUY/HOLD/SELL Recommendations Active** — Each 60-min cycle filters predicted top-12 to only sentiment ≥ 0.0, then issues BUY for top 6 (score-weighted allocation from cash), HOLD for owned tickers past the cap, SELL for owned tickers that dropped out or turned negative. Score-weighted BUY sizing now enforces the configured max-position cap after redistribution so one name cannot exceed risk/reward bounds. Dashboard only shows eligible tickers (no negative sentiment rows). Final recommendations issued with `EXECUTE BY HH:MM UTC` only when gate expired + market open.
@@ -76,7 +76,7 @@ See `ORACLE_ALWAYS_FREE_SETUP.md` for the full OCI Ampere A1 bootstrap and `POST
 | `FINBERT_TEMPERATURE` | 0.5 | Logit temperature scaling (T<1 sharpens) |
 | `SENTIMENT_BUY_THRESHOLD` | 0.0 | Minimum sentiment for BUY decision |
 | `NEWS_CYCLE_HOURS` | 1 | News stream frequency |
-| `EXECUTION_WINDOW_MINUTES` | 1 | Time to execute after final recommendation |
+| `EXECUTION_WINDOW_MINUTES` | 15 | Advisory window (user can trade anytime) |
 | `INSTITUTIONAL_BANKS` | JPM,GS,BAC,MS,C | Skip solvency gate for banks |
 | `ENABLE_ARTICLE_SUMMARIZATION` | False | Use LLM to summarize article body before scoring |
 | `SUMMARIZE_PROVIDER` | `openai` | LLM provider: `openai`, `anthropic`, or `gemini` |

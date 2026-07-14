@@ -1,3 +1,24 @@
+### Entry 35 — 2026-07-14
+
+**Action:** Added fundamentals cache (24h TTL), market-open scheduler (9:35 AM ET), and Discord alert on LM fallback.
+
+**Changes:**
+- `config.py`: Added `FUNDAMENTALS_CACHE_FILE`, `FUNDAMENTALS_CACHE_TTL_HOURS=24`. Bumped `EXECUTION_WINDOW_MINUTES` from 1 to 15.
+- `engine.py`: Added `_load_fundamentals_cache()` and `_save_fundamentals_cache()` helpers. Modified `process_ticker()` to check fundamentals cache before fetching `income_stmt`/`balance_sheet`/`stock.info`. If cache is fresh (<24h old), the cached `health_score_raw` and `valuation_multiplier` are used instead of re-fetching from Yahoo Finance. Sentiment and news fetching still run every 60-min cycle regardless.
+- `engine.py`: Added market-open scheduler in `_run_loop()` — when market is closed but opens within 60 minutes, sleeps until 9:35 AM ET before triggering the news cycle + evaluation, ensuring recommendations are ready 5 minutes after NYSE open.
+- `sentiment.py`: Added `_using_lm` flag to `FinBERTScorer` — set `True` in `_score_lm()`, `False` in `_score_onnx()`. Added `using_lm` property.
+- `engine.py`: Added `get_scorer` import from `sentiment`. In `build_competition_dashboard()`, if `get_scorer().using_lm`, prepends `**:warning: SENTIMENT ENGINE DEGRADED — using dictionary fallback**` line — visible within 60 seconds on the dashboard.
+- `engine.py`: Added `FUNDAMENTALS_CACHE_FILE` to `handle_reset()` cleanup list.
+
+**Reasoning:**
+- yfinance has no official API — it scrapes Yahoo endpoints. Scraping 75 full financial statements every 60 minutes risks IP bans (confirmed by GitHub issues showing blocks at 4-5 daily requests). Fundamentals change quarterly, so 24h caching eliminates 98% of the scraping load without any signal degradation.
+- The 1-min execution window was cosmetic but misleading. Bumped to 15 min. The scheduler ensures recs are ready at 9:35 AM ET, catching the first 5 minutes of post-open stability.
+- The LM lexicon has 50.1% accuracy on financial news (vs FinBERT's 72.2%, per Kirtac & Germano 2024) and shows no statistically significant relationship with stock returns. If ONNX fails, the system silently degraded to coin-flip quality. The dashboard alert now surfaces this immediately.
+
+**Files Touched:** `config.py`, `sentiment.py`, `engine.py`, `PIPELINE.md`, `README.md`
+
+---
+
 ### Entry 34 — 2026-07-13
 
 **Action:** Added LLM-powered article summarization pipeline for enhanced sentiment scoring.

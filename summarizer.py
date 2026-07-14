@@ -213,6 +213,24 @@ def summarize(text, provider="openai", api_key=None):
         return text[:500]
 
 
+def extract_article_lead(url, max_lines=3):
+    """Fetch article and return the first ~max_lines of body text.
+
+    No LLM call, no API key — just raw text for model scoring.
+    Returns string or None on failure.
+    """
+    body = fetch_article(url)
+    if not body:
+        return None
+    lines = [l.strip() for l in body.split(". ") if l.strip()]
+    lead = ". ".join(lines[:max_lines])
+    if not lead.endswith("."):
+        lead += "."
+    if len(lead) > 2000:
+        lead = lead[:1997] + "..."
+    return lead
+
+
 def summarize_article(url, provider="openai", api_key=None):
     """Fetch article from URL and summarize it.
 

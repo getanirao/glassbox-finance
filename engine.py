@@ -18,7 +18,7 @@ import matplotlib.dates as mdates
 
 from config import *
 
-from sentiment import score_headline
+from sentiment import score_headline, get_scorer
 
 NEWS_LOCK_OWNER = f"{os.getpid()}:{datetime.datetime.now(datetime.timezone.utc).isoformat()}"
 
@@ -329,6 +329,23 @@ def save_competition_ledger(ledger):
         json.dump(ledger, f, indent=2)
 
 
+# ── fundamentals cache ──────────────────────────────────────────────────
+
+def _load_fundamentals_cache():
+    if os.path.exists(FUNDAMENTALS_CACHE_FILE):
+        try:
+            with open(FUNDAMENTALS_CACHE_FILE, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_fundamentals_cache(cache):
+    with open(FUNDAMENTALS_CACHE_FILE, "w") as f:
+        json.dump(cache, f, indent=2)
+
+
 def record_trade(ticker, action, shares, price, trade_time=None):
     ledger = load_competition_ledger()
     if trade_time:
@@ -561,6 +578,7 @@ def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_n
         return base
     name = TICKER_NAMES.get(ticker, "").lower()
     best_h = headlines[0]
+    best_net = 0.0
     best_score = -1.0
     for h in headlines:
         net, _, _ = score_headline(h)
@@ -574,15 +592,14 @@ def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_n
         if score > best_score:
             best_score = score
             best_h = h
+            best_net = net
     if len(best_h) > 130:
         truncated = best_h[:130]
         last_space = truncated.rfind(" ")
         if last_space > 0:
             truncated = truncated[:last_space]
         best_h = truncated + "\u2026"
-    if long_sent is not None:
-        return f"{ticker} [{rolling_sent:+.2f} / {long_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> {best_h}"
-    return f"{ticker} [{rolling_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> {best_h}"
+    return f"{ticker} [{best_net:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> {best_h}"
 
 
 def build_news_roundup(alerts, et_now):
@@ -616,13 +633,18 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
     lines.append(f"**Glassbox Finance — COMPETITION DASHBOARD**")
     lines.append(f"Market: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
     lines.append(f"Portfolio: **${pv:,.2f}** ({arrow}{change:,.2f} / {arrow}{pct:.2f}%)")
+    if get_scorer().using_lm:
+        lines.append("**:warning: SENTIMENT ENGINE DEGRADED — using dictionary fallback**")
     lines.append(f"Cash: ${ledger['cash_balance']:,.2f}  |  Holdings: {len(ledger['holdings'])} / {MAX_PORTFOLIO_HOLDINGS}")
     lines.append("")
     if ledger["holdings"]:
         lines.append("**Real Holdings:**")
         lines.append("```")
-        lines.append(f"{'Ticker':<8} {'Shares':>7} {'Avg Price':>11} {'Current':>9} {'Value':>12} {'P&L':>12}")
-        lines.append("-" * 59)
+        hdr = f"{'Ticker':<8} {'Shrs':>6} {'Now':>7} {'Val':>10} {'P&L':>9}"
+        dash = "-" * len(hdr)
+        lines.append(dash)
+        lines.append(hdr)
+        lines.append(dash)
         total_val = 0
         total_cost = 0
         for t, pos in sorted(ledger["holdings"].items()):
@@ -633,15 +655,16 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
             pnl_s = f"{'+' if pnl >= 0 else ''}{pnl:,.2f}"
             total_val += val
             total_cost += cost
-            lines.append(f"{t:<8} {pos['shares']:>7} ${pos['avg_price']:>9,.2f} ${cp:>7,.2f} ${val:>9,.2f} ${pnl_s:>10}")
-        lines.append("-" * 59)
-        lines.append(f"{'TOTAL':<8} {'':>7} {'':>11} {'':>9} ${total_val:>9,.2f} ${total_val - total_cost:>+9,.2f}")
+            lines.append(f"{t:<8} {pos['shares']:>6} ${cp:>6.2f} ${val:>9.2f} ${pnl_s:>8}")
+        lines.append(dash)
+        lines.append(f"{'TOTAL':<8} {'':>6} {'':>7} ${total_val:>9.2f} ${total_val - total_cost:>+8.2f}")
         lines.append("```")
     lines.append("")
     lines.append("**Predicted Allocation (next rebalance):**")
     lines.append("```")
-    lines.append(f"{'Ticker':<8} {'Score':>8} {'Sentiment':>10} {'Fund':>8} {'Decision':>10} {'Target Shares':>14}")
-    lines.append("-" * 60)
+    lines.append(f"{'Ticker':<8} {'Rank':>6} {'Sent':>6} {'Base':>6} {'Dec':>5} {'Qty':>5}")
+    dash = "-" * (8 + 6 + 6 + 6 + 5 + 5 + 5)
+    lines.append(dash)
     rec_map = {rec["ticker"]: rec for rec in recs}
     for r in predicted:
         ticker = r["ticker"]
@@ -651,8 +674,8 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
         rec = rec_map.get(ticker, {})
         action = rec.get("action", "?")
         shares = rec.get("target_shares", 0)
-        lines.append(f"{ticker:<8} {score:>7.1f} {sent:>+9.3f} {fund:>7.1f} {action:>10} {shares:>13}")
-    lines.append("-" * 60)
+        lines.append(f"{ticker:<8} {score:>6.1f} {sent:>+6.3f} {fund:>6.1f} {action:>5} {shares:>5}")
+    lines.append(dash)
     lines.append("```")
     if has_final_recs:
         execute_by = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES))
@@ -732,22 +755,21 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
         )
         if already_seen:
             continue
-        # Optionally fetch article body + LLM summarize before scoring
+        # Enrich headline with first few lines of article body for better context
         text_to_score = title
-        if ENABLE_ARTICLE_SUMMARIZATION:
-            try:
-                url = (
-                    (content.get("canonicalUrl") or {}).get("url")
-                    or (content.get("clickThroughUrl") or {}).get("url")
-                    or ""
-                )
-                if url:
-                    from summarizer import summarize_article as _summarize_article
-                    summary, _ = _summarize_article(url, provider=SUMMARIZE_PROVIDER)
-                    if summary:
-                        text_to_score = summary
-            except Exception:
-                pass
+        try:
+            url = (
+                (content.get("canonicalUrl") or {}).get("url")
+                or (content.get("clickThroughUrl") or {}).get("url")
+                or ""
+            )
+            if url:
+                from summarizer import extract_article_lead
+                lead = extract_article_lead(url, max_lines=3)
+                if lead:
+                    text_to_score = f"{title}. {lead}"
+        except Exception:
+            pass
         net, pos_prob, neg_prob = score_headline(text_to_score)
         news_cache["headlines"].append({
             "text": title,
@@ -772,83 +794,119 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
 
 def process_ticker(ticker, index, total, news_cache):
     print(f"\n  [{index}/{total}] Processing {ticker} ...")
-    stock = yf.Ticker(ticker)
-    inc = stock.income_stmt
-    if not validate_statement(inc, "Income Statement"):
-        print(f"  [{index}/{total}] {ticker} SKIPPED - No income statement data.")
-        return None
-    bs = stock.balance_sheet
-    if not validate_statement(bs, "Balance Sheet"):
-        print(f"  [{index}/{total}] {ticker} SKIPPED - No balance sheet data.")
-        return None
-    if ticker in INSTITUTIONAL_BANKS:
-        print(f"  [{index}/{total}] [Sector Notice] Skipping solvency gate for {ticker} due to financial institution banking book structures.")
-        print(f"  [{index}/{total}] Assigning baseline neutral safety score (75.0/100).")
-        solvency_ok = True
-        health_score = 75.0
-        cr = None
-        dte = None
-        directive = f"[MOCK ACTION] Would PASS Solvency (Bank Neutral) and BUY shares."
-    else:
-        solvency_ok, health_score, cr, dte = evaluate_solvency(bs)
-        if solvency_ok is None:
-            print(f"  [{index}/{total}] {ticker} SKIPPED - Solvency line items not found.")
-            return None
+    fund_cache = _load_fundamentals_cache()
+    cached = fund_cache.get(ticker)
+    cache_fresh = False
+    if cached:
+        cached_at = datetime.datetime.fromisoformat(cached["cached_at"])
+        if cached_at.tzinfo is None:
+            cached_at = cached_at.replace(tzinfo=datetime.timezone.utc)
+        age = datetime.datetime.now(datetime.timezone.utc) - cached_at
+        cache_fresh = age < datetime.timedelta(hours=FUNDAMENTALS_CACHE_TTL_HOURS)
+
+    if cache_fresh:
+        age_h = age.total_seconds() / 3600
+        print(f"  [{index}/{total}] {ticker} fundamentals cache HIT ({age_h:.1f}h old)")
+        solvency_ok = cached["solvency_ok"]
+        cr = cached.get("current_ratio")
+        dte = cached.get("debt_to_equity")
+        valuation_multiplier = cached["valuation_multiplier"]
+        health_score = cached["health_score_raw"] * valuation_multiplier
+        if ticker in INSTITUTIONAL_BANKS:
+            status = "PASS (Bank Neutral, cached)"
+        else:
+            status = "PASS (cached)" if solvency_ok else "FAIL (cached)"
         if not solvency_ok:
-            if dte is not None and dte > 1.5:
-                directive = f"[MOCK ACTION] Would REJECT due to high leverage (D/E: {dte:.2f})."
-                print(f"  [{index}/{total}] [Semantic Analysis]: High leverage indicates this enterprise relies heavily on debt financing, making it highly vulnerable to capital insolvency during contractionary macroeconomic cycles.")
-            elif cr is not None and cr < 1.2:
-                directive = f"[MOCK ACTION] Would REJECT due to insufficient liquidity (CR: {cr:.2f})."
-                print(f"  [{index}/{total}] [Semantic Analysis]: Short-term liquidity bounds are breached, indicating the company mathematically lacks the liquid assets required to satisfy its immediate operational obligations over the next fiscal year.")
-            else:
-                directive = f"[MOCK ACTION] Would REJECT (CR={cr:.2f}, D/E={dte:.2f})."
+            directive = f"[CACHE] Would REJECT (CR={cr}, D/E={dte})."
         else:
-            directive = f"[MOCK ACTION] Would PASS Solvency and BUY shares."
-    info = stock.info
-    roe = info.get("returnOnEquity")
-    if roe and roe > 0:
-        roe_factor = max(0.5, min(1.5, roe / 0.20))
+            directive = "[CACHE] Would PASS Solvency and BUY shares."
     else:
-        roe_factor = 1.0
-    if ticker in INSTITUTIONAL_BANKS:
-        pb = info.get("priceToBook")
-        if pb and pb > 0:
-            if pb < 0.8:
-                pb_factor = 0.8
-            elif 0.8 <= pb < 1.0:
-                pb_factor = 0.9
-            elif 1.0 <= pb <= 1.5:
+        stock = yf.Ticker(ticker)
+        inc = stock.income_stmt
+        if not validate_statement(inc, "Income Statement"):
+            print(f"  [{index}/{total}] {ticker} SKIPPED - No income statement data.")
+            return None
+        bs = stock.balance_sheet
+        if not validate_statement(bs, "Balance Sheet"):
+            print(f"  [{index}/{total}] {ticker} SKIPPED - No balance sheet data.")
+            return None
+        if ticker in INSTITUTIONAL_BANKS:
+            print(f"  [{index}/{total}] [Sector Notice] Skipping solvency gate for {ticker} due to financial institution banking book structures.")
+            print(f"  [{index}/{total}] Assigning baseline neutral safety score (75.0/100).")
+            solvency_ok = True
+            health_score_raw = 75.0
+            cr = None
+            dte = None
+            directive = "[MOCK ACTION] Would PASS Solvency (Bank Neutral) and BUY shares."
+        else:
+            solvency_ok, health_score_raw, cr, dte = evaluate_solvency(bs)
+            if solvency_ok is None:
+                print(f"  [{index}/{total}] {ticker} SKIPPED - Solvency line items not found.")
+                return None
+            if not solvency_ok:
+                if dte is not None and dte > 1.5:
+                    directive = f"[MOCK ACTION] Would REJECT due to high leverage (D/E: {dte:.2f})."
+                    print(f"  [{index}/{total}] [Semantic Analysis]: High leverage indicates this enterprise relies heavily on debt financing, making it highly vulnerable to capital insolvency during contractionary macroeconomic cycles.")
+                elif cr is not None and cr < 1.2:
+                    directive = f"[MOCK ACTION] Would REJECT due to insufficient liquidity (CR: {cr:.2f})."
+                    print(f"  [{index}/{total}] [Semantic Analysis]: Short-term liquidity bounds are breached, indicating the company mathematically lacks the liquid assets required to satisfy its immediate operational obligations over the next fiscal year.")
+                else:
+                    directive = f"[MOCK ACTION] Would REJECT (CR={cr:.2f}, D/E={dte:.2f})."
+            else:
+                directive = "[MOCK ACTION] Would PASS Solvency and BUY shares."
+        info = stock.info
+        roe = info.get("returnOnEquity")
+        if roe and roe > 0:
+            roe_factor = max(0.5, min(1.5, roe / 0.20))
+        else:
+            roe_factor = 1.0
+        if ticker in INSTITUTIONAL_BANKS:
+            pb = info.get("priceToBook")
+            if pb and pb > 0:
+                if pb < 0.8:
+                    pb_factor = 0.8
+                elif 0.8 <= pb < 1.0:
+                    pb_factor = 0.9
+                elif 1.0 <= pb <= 1.5:
+                    pb_factor = 1.0
+                elif 1.5 < pb <= 2.0:
+                    pb_factor = 0.9
+                else:
+                    pb_factor = 0.85
+            else:
                 pb_factor = 1.0
-            elif 1.5 < pb <= 2.0:
-                pb_factor = 0.9
-            else:
-                pb_factor = 0.85
+            valuation_multiplier = roe_factor * 0.7 + pb_factor * 0.3
         else:
-            pb_factor = 1.0
-        valuation_multiplier = roe_factor * 0.7 + pb_factor * 0.3
-    else:
-        pe = info.get("trailingPE") or info.get("forwardPE")
-        if pe and pe > 0:
-            if pe < 5:
-                pe_factor = 0.7
-            elif 5 <= pe < 10:
-                pe_factor = 0.9
-            elif 10 <= pe <= 20:
+            pe = info.get("trailingPE") or info.get("forwardPE")
+            if pe and pe > 0:
+                if pe < 5:
+                    pe_factor = 0.7
+                elif 5 <= pe < 10:
+                    pe_factor = 0.9
+                elif 10 <= pe <= 20:
+                    pe_factor = 1.0
+                elif 20 < pe <= 40:
+                    pe_factor = 0.9
+                else:
+                    pe_factor = 0.8
+            else:
                 pe_factor = 1.0
-            elif 20 < pe <= 40:
-                pe_factor = 0.9
-            else:
-                pe_factor = 0.8
-        else:
-            pe_factor = 1.0
-        valuation_multiplier = roe_factor * 0.5 + pe_factor * 0.5
-    health_score = health_score * valuation_multiplier
-    net_sentiment, penalty, headlines, rolling_pos, rolling_neg, rolling_count, long_sent, long_pos, long_neg, long_count = sentiment_gate(stock, ticker, news_cache, skip_fetch=True)
+            valuation_multiplier = roe_factor * 0.5 + pe_factor * 0.5
+        health_score = health_score_raw * valuation_multiplier
+        fund_cache[ticker] = {
+            "solvency_ok": solvency_ok,
+            "health_score_raw": health_score_raw,
+            "current_ratio": cr,
+            "debt_to_equity": dte,
+            "valuation_multiplier": valuation_multiplier,
+            "cached_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        }
+        _save_fundamentals_cache(fund_cache)
+        status = "PASS (Bank Neutral)" if ticker in INSTITUTIONAL_BANKS else ("PASS" if solvency_ok else "FAIL")
+    net_sentiment, penalty, headlines, rolling_pos, rolling_neg, rolling_count, long_sent, long_pos, long_neg, long_count = sentiment_gate(yf.Ticker(ticker), ticker, news_cache, skip_fetch=True)
     if solvency_ok and net_sentiment < 0.0:
         print(f"  [{index}/{total}] [Semantic Analysis]: Computational linguistics detect high rhetorical negative sentiment across public news sources, indicating structural headline risk that down-weights our core fundamental asset valuation.")
     adjusted_score = (health_score * penalty) if solvency_ok else health_score
-    status = "PASS (Bank Neutral)" if ticker in INSTITUTIONAL_BANKS else ("PASS" if solvency_ok else "FAIL")
     print(f"  [{index}/{total}] {ticker} {status} (Score: {adjusted_score:.1f}/100, ValMult: {valuation_multiplier:.3f})")
     return {
         "ticker": ticker,
@@ -1039,6 +1097,7 @@ def handle_reset():
         MESSAGE_STATE_FILE, NEWS_MESSAGE_STATE_FILE,
         NEWS_CYCLE_FILE, NEWS_LOCK_FILE,
         COMPETITION_LEDGER, COMPETITION_MESSAGE_STATE, COMPETITION_PREDICTION_FILE,
+        FUNDAMENTALS_CACHE_FILE,
     ]
     statuses = {}
     for path in state_files:
@@ -1167,6 +1226,11 @@ class EngineRunner:
         self._stopped = threading.Event()
         self._trigger = threading.Event()
         self._thread = None
+        # Clear any stale news lock from previous run
+        for f in os.listdir(DATA_DIR):
+            if f.startswith(".news_lock"):
+                os.remove(os.path.join(DATA_DIR, f))
+                print(f"  [Engine] Cleaned stale lock: {f}")
         self.status = {
             "mode": run_mode,
             "market_state": "ANALYTICAL_OFF_HOURS",
@@ -1253,6 +1317,20 @@ class EngineRunner:
 
             market_state, et_now = check_market_clock()
             self._update_status(market_state=market_state)
+
+            # ── Market-open scheduler ──
+            if market_state == "ANALYTICAL_OFF_HOURS":
+                eastern = zoneinfo.ZoneInfo("US/Eastern")
+                et_dt = datetime.datetime.now(eastern)
+                today_str = et_dt.date().isoformat()
+                if today_str not in NYSE_FULL_DAY_CLOSURES_2026 and et_dt.weekday() < 5:
+                    open_dt = datetime.datetime(et_dt.year, et_dt.month, et_dt.day, 9, 30, tzinfo=eastern)
+                    if et_dt < open_dt and (open_dt - et_dt).total_seconds() <= 3600:
+                        target_dt = open_dt + datetime.timedelta(minutes=5)
+                        sleep_sec = (target_dt - et_dt).total_seconds()
+                        print(f"  [Scheduler] Market opens at 9:30 ET — waiting {sleep_sec:.0f}s until 9:35 ET eval.")
+                        self._sleep_with_trigger(sleep_sec)
+                        continue
 
             # ── Clock 1: 60-min news cycle + full eval ──
             if check_news_cycle():

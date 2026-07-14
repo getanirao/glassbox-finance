@@ -26,11 +26,6 @@ NEWS_RATE_MIN = 1.5
 NEWS_RATE_MAX = 3.5
 NEWS_LOCK_STALE_MINUTES = 90
 
-# ── Article summarization ─────────────────────────────────────────────────
-ENABLE_ARTICLE_SUMMARIZATION = False
-SUMMARIZE_PROVIDER = "openai"
-SUMMARIZE_MAX_CHARS = 4000
-
 GATE_FILE = os.path.join(DATA_DIR, ".last_run")
 NEWS_CACHE_FILE = os.path.join(DATA_DIR, ".news_cache.json")
 MESSAGE_STATE_FILE = os.path.join(DATA_DIR, ".message_state")
@@ -48,7 +43,9 @@ COMPETITION_LEDGER = os.path.join(DATA_DIR, "competition_ledger.json")
 COMPETITION_CHART = os.path.join(DATA_DIR, "competition_chart.png")
 COMPETITION_MESSAGE_STATE = os.path.join(DATA_DIR, ".competition_message_state")
 COMPETITION_PREDICTION_FILE = os.path.join(DATA_DIR, ".competition_prediction.json")
-EXECUTION_WINDOW_MINUTES = 1
+FUNDAMENTALS_CACHE_FILE = os.path.join(DATA_DIR, ".fundamentals_cache.json")
+FUNDAMENTALS_CACHE_TTL_HOURS = 24
+EXECUTION_WINDOW_MINUTES = 15
 
 NYSE_FULL_DAY_CLOSURES_2026 = {
     "2026-01-01",

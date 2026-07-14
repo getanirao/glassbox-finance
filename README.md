@@ -78,6 +78,9 @@ See `ORACLE_ALWAYS_FREE_SETUP.md` for the full OCI Ampere A1 bootstrap and `POST
 | `NEWS_CYCLE_HOURS` | 1 | News stream frequency |
 | `EXECUTION_WINDOW_MINUTES` | 1 | Time to execute after final recommendation |
 | `INSTITUTIONAL_BANKS` | JPM,GS,BAC,MS,C | Skip solvency gate for banks |
+| `ENABLE_ARTICLE_SUMMARIZATION` | False | Use LLM to summarize article body before scoring |
+| `SUMMARIZE_PROVIDER` | `openai` | LLM provider: `openai`, `anthropic`, or `gemini` |
+| `SUMMARIZE_MAX_CHARS` | 4000 | Max characters to send for summarization |
 
 ### Market State Flags
 - **`MARKET_OPEN`**: NYSE trading hours (9:30 AM–4:00 PM ET, Mon–Fri). Final recommendations unlocked.
@@ -95,7 +98,7 @@ See `ORACLE_ALWAYS_FREE_SETUP.md` for the full OCI Ampere A1 bootstrap and `POST
 | `/news` | News cache summary with short + 21d sentiment |
 | `/history` | Last 20 portfolio value entries |
 | `/chart` | Latest competition chart image |
-| `/trade` | Log a trade: `ticker:CSCO action:buy shares:100 price:52.40` |
+| `/trade` | Log a trade: `ticker:CSCO action:buy shares:100 time:13:45` (optional `time` in HH:MM UTC, price fetched live) |
 | `/hold` | Confirm a HOLD: `ticker:MSFT` |
 | `/help` | Command list |
 | `/pause` | Pause engine (Admin) |

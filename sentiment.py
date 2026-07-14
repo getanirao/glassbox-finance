@@ -19,8 +19,8 @@ class FinBERTScorer:
         self.model_dir = model_dir
         self._session = None
         self._tokenizer = None
-        self._pos_idx = 0
-        self._neg_idx = 1
+        self._pos_idx = 2
+        self._neg_idx = 0
 
     def _ensure_loaded(self):
         if self._session is not None:

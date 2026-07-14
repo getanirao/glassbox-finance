@@ -1,3 +1,21 @@
+### Entry 34 — 2026-07-13
+
+**Action:** Added LLM-powered article summarization pipeline for enhanced sentiment scoring.
+
+**Changes:**
+- Created `summarizer.py` — fetches full article body from news URLs (via BeautifulSoup), then summarizes via configurable LLM provider (OpenAI, Anthropic, or Gemini)
+- Added `ENABLE_ARTICLE_SUMMARIZATION`, `SUMMARIZE_PROVIDER`, `SUMMARIZE_MAX_CHARS` to `config.py` (default disabled — requires API key)
+- Updated `sentiment_gate()` in `engine.py` to optionally fetch and summarize article body before scoring headline sentiment
+- Added `beautifulsoup4>=4.12.0` to `requirements.txt`
+- Documented LLM API keys in `.env.example`
+- Merged PR #3 (ShadowKingYT444): Oracle ARM deployment, news worker roles, GitHub Actions cron, atomic news locks
+
+**Logical Integration:** When `ENABLE_ARTICLE_SUMMARIZATION=True` and an LLM API key is configured, the engine now scrapes article bodies from news URLs and passes them through the LLM for financial summarization before sentiment scoring. This provides richer context than headlines alone. Default is off to avoid adding API dependencies.
+
+**Files Touched:** `summarizer.py` (new), `config.py`, `engine.py`, `requirements.txt`, `.env.example`, `PIPELINE.md`
+
+---
+
 ### Entry 33 — 2026-07-13T11:56:00Z
 
 **Action:** Prepared Oracle Always Free ARM deployment and news-worker roles.

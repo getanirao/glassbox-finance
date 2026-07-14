@@ -329,9 +329,18 @@ def save_competition_ledger(ledger):
         json.dump(ledger, f, indent=2)
 
 
-def record_trade(ticker, action, shares, price):
+def record_trade(ticker, action, shares, price, trade_time=None):
     ledger = load_competition_ledger()
-    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if trade_time:
+        try:
+            parts = trade_time.replace(" ", "").split(":")
+            h, m = int(parts[0]), int(parts[1])
+            today = datetime.date.today()
+            ts = datetime.datetime(today.year, today.month, today.day, h, m, tzinfo=datetime.timezone.utc).isoformat()
+        except (ValueError, IndexError):
+            ts = trade_time
+    else:
+        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
     if action == "buy":
         if ticker in ledger["holdings"]:
             pos = ledger["holdings"][ticker]
@@ -356,7 +365,7 @@ def record_trade(ticker, action, shares, price):
         total_holdings_value += p["shares"] * cp
     portfolio_value = ledger["cash_balance"] + total_holdings_value
     ledger["history"].append({
-        "timestamp": now,
+        "timestamp": ts,
         "portfolio_value": round(portfolio_value, 2),
         "event": f"{action.upper()} {shares} {ticker} @ ${price:.2f}",
     })
@@ -630,7 +639,7 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
             total_cost += cost
             lines.append(f"{t:<8} {pos['shares']:>7} ${pos['avg_price']:>9,.2f} ${cp:>7,.2f} ${val:>9,.2f} ${pnl_s:>10}")
         lines.append("-" * 59)
-        lines.append(f"{'TOTAL':<8} {'':>7} {'':>11} {'':>9} ${total_val:>9,.2f} ${total_cost - total_val:>+9,.2f}")
+        lines.append(f"{'TOTAL':<8} {'':>7} {'':>11} {'':>9} ${total_val:>9,.2f} ${total_val - total_cost:>+9,.2f}")
         lines.append("```")
     lines.append("")
     lines.append("**Predicted Allocation (next rebalance):**")
@@ -726,7 +735,23 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
         )
         if already_seen:
             continue
-        net, pos_prob, neg_prob = score_headline(title)
+        # Optionally fetch article body + LLM summarize before scoring
+        text_to_score = title
+        if ENABLE_ARTICLE_SUMMARIZATION:
+            try:
+                url = (
+                    (content.get("canonicalUrl") or {}).get("url")
+                    or (content.get("clickThroughUrl") or {}).get("url")
+                    or ""
+                )
+                if url:
+                    from summarizer import summarize_article as _summarize_article
+                    summary, _ = _summarize_article(url, provider=SUMMARIZE_PROVIDER)
+                    if summary:
+                        text_to_score = summary
+            except Exception:
+                pass
+        net, pos_prob, neg_prob = score_headline(text_to_score)
         news_cache["headlines"].append({
             "text": title,
             "ticker": ticker,

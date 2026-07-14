@@ -34,8 +34,10 @@ class GlassboxBot(commands.Bot):
         print(f"\n  [Bot] Logged in as {self.user} (ID: {self.user.id})")
         if not self._synced:
             await self.tree.sync()
+            for guild in self.guilds:
+                await self.tree.sync(guild=guild)
             self._synced = True
-            print(f"  [Bot] Slash commands synced to {len(self.guilds)} guild(s).")
+            print(f"  [Bot] Slash commands synced (global + {len(self.guilds)} guild(s)).")
 
 
 def admin_check(interaction: discord.Interaction) -> bool:
@@ -133,10 +135,11 @@ class QueryCog(commands.Cog):
     @app_commands.command(name="holdings", description="Show current competition portfolio holdings")
     @app_commands.check(trader_check)
     async def cmd_holdings(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         from engine import load_competition_ledger
         ledger = load_competition_ledger()
         if not ledger["holdings"]:
-            await interaction.response.send_message("No current holdings.", ephemeral=True)
+            await interaction.followup.send("No current holdings.", ephemeral=True)
             return
         lines = [f"**Competition Portfolio**  |  Cash: ${ledger['cash_balance']:,.2f}"]
         lines.append("```")
@@ -157,7 +160,7 @@ class QueryCog(commands.Cog):
         lines.append("-" * len(header))
         lines.append(f"{'TOTAL':<8} {'':>8} {'':>12} ${total:>11,.2f}")
         lines.append("```")
-        await interaction.response.send_message("\n".join(lines), ephemeral=False)
+        await interaction.followup.send("\n".join(lines), ephemeral=False)
 
     @app_commands.command(name="news", description="Show latest news roundup")
     @app_commands.check(trader_check)
@@ -221,32 +224,34 @@ class QueryCog(commands.Cog):
 
     @app_commands.command(name="trade", description="Log a real trade for the competition ledger")
     @app_commands.check(trader_check)
-    async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int):
+    async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int, time: str = ""):
+        await interaction.response.defer()
         from engine import record_trade, load_competition_ledger, _get_price
         ticker = ticker.upper()
         action = action.lower()
         if action not in ("buy", "sell"):
-            await interaction.response.send_message("Action must be `buy` or `sell`.", ephemeral=True)
+            await interaction.followup.send("Action must be `buy` or `sell`.", ephemeral=True)
             return
         if shares <= 0:
-            await interaction.response.send_message("Shares must be positive.", ephemeral=True)
+            await interaction.followup.send("Shares must be positive.", ephemeral=True)
             return
         price = _get_price(ticker)
         if price is None or price <= 0:
-            await interaction.response.send_message(f"Could not fetch live price for {ticker}.", ephemeral=True)
+            await interaction.followup.send(f"Could not fetch live price for {ticker}.", ephemeral=True)
             return
-        ok = record_trade(ticker, action, shares, price)
+        ok = record_trade(ticker, action, shares, price, trade_time=time.strip() if time.strip() else None)
         if not ok:
-            await interaction.response.send_message(f"Cannot sell {ticker} — not in ledger.", ephemeral=True)
+            await interaction.followup.send(f"Cannot sell {ticker} — not in ledger.", ephemeral=True)
             return
         ledger = load_competition_ledger()
         pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else 0
+        ts = time if time else ledger["history"][-1]["timestamp"]
         lines = [
             f"**Trade Logged** — {action.upper()} {shares} {ticker} @ ${price:.2f}",
-            f"Cash: ${ledger['cash_balance']:,.2f}  |  Portfolio: ${pv:,.2f}",
+            f"Time: {ts}  |  Cash: ${ledger['cash_balance']:,.2f}  |  Portfolio: ${pv:,.2f}",
             f"Holdings: {len(ledger['holdings'])} positions",
         ]
-        await interaction.response.send_message("\n".join(lines), ephemeral=False)
+        await interaction.followup.send("\n".join(lines), ephemeral=False)
 
     @app_commands.command(name="hold", description="Confirm a HOLD recommendation from the engine")
     @app_commands.check(trader_check)

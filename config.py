@@ -26,6 +26,11 @@ NEWS_RATE_MIN = 1.5
 NEWS_RATE_MAX = 3.5
 NEWS_LOCK_STALE_MINUTES = 90
 
+# ── Article summarization ─────────────────────────────────────────────────
+ENABLE_ARTICLE_SUMMARIZATION = False
+SUMMARIZE_PROVIDER = "openai"
+SUMMARIZE_MAX_CHARS = 4000
+
 GATE_FILE = os.path.join(DATA_DIR, ".last_run")
 NEWS_CACHE_FILE = os.path.join(DATA_DIR, ".news_cache.json")
 MESSAGE_STATE_FILE = os.path.join(DATA_DIR, ".message_state")

@@ -1,25 +1,32 @@
-"""Export FinBERT to ONNX with INT8 dynamic quantization."""
+"""Export FinBERT to ONNX (quantization skipped when onnx package unavailable)."""
+import argparse
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-MODEL_NAME = "ProsusAI/finbert"
 OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "models"
 )
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--model-path",
+        default="tabularisai/ModernFinBERT",
+        help="Model name (HuggingFace hub) or local path to fine-tuned model",
+    )
+    args = parser.parse_args()
+
     import torch
     from transformers import AutoTokenizer, AutoModelForSequenceClassification
-    from onnxruntime.quantization import quantize_dynamic, QuantType
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    print(f"Loading {MODEL_NAME}...")
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_NAME)
+    print(f"Loading {args.model_path}...")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    model = AutoModelForSequenceClassification.from_pretrained(args.model_path)
     model.eval()
 
     print("Saving tokenizer...")
@@ -28,6 +35,7 @@ def main():
     print("Exporting to ONNX...")
     dummy_input = tokenizer("Test headline", return_tensors="pt")
     onnx_path = os.path.join(OUTPUT_DIR, "finbert.onnx")
+    quantized_path = os.path.join(OUTPUT_DIR, "finbert_quantized.onnx")
 
     torch.onnx.export(
         model,
@@ -44,13 +52,19 @@ def main():
         dynamo=False,
     )
 
-    print("Applying INT8 dynamic quantization...")
-    quantized_path = os.path.join(OUTPUT_DIR, "finbert_quantized.onnx")
-    quantize_dynamic(onnx_path, quantized_path, weight_type=QuantType.QInt8)
+    # Try INT8 quantization, skip if onnx package unavailable
+    try:
+        from onnxruntime.quantization import quantize_dynamic, QuantType
+        print("Applying INT8 dynamic quantization...")
+        quantize_dynamic(onnx_path, quantized_path, weight_type=QuantType.QInt8)
+        os.remove(onnx_path)
+    except Exception:
+        import warnings
+        warnings.warn("INT8 quantization unavailable - saving unquantized ONNX")
+        os.rename(onnx_path, quantized_path)
 
-    os.remove(onnx_path)
     size_mb = os.path.getsize(quantized_path) / 1e6
-    print(f"Quantized model saved: {quantized_path} ({size_mb:.1f} MB)")
+    print(f"Model saved: {quantized_path} ({size_mb:.1f} MB)")
 
 
 if __name__ == "__main__":

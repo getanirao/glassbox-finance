@@ -196,7 +196,7 @@ class QueryCog(commands.Cog):
     @app_commands.check(trader_check)
     async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int, time: str = ""):
         await interaction.response.defer()
-        from engine import record_trade, load_competition_ledger, _get_price
+        from engine import record_trade, load_competition_ledger, _get_price, _get_price_at
         ticker = ticker.upper()
         action = action.lower()
         if action not in ("buy", "sell"):
@@ -205,11 +205,17 @@ class QueryCog(commands.Cog):
         if shares <= 0:
             await interaction.followup.send("Shares must be positive.", ephemeral=True)
             return
-        price = _get_price(ticker)
+        trade_time = time.strip() if time.strip() else None
+        if trade_time:
+            price = _get_price_at(ticker, trade_time)
+            if price is None:
+                price = _get_price(ticker)
+        else:
+            price = _get_price(ticker)
         if price is None or price <= 0:
-            await interaction.followup.send(f"Could not fetch live price for {ticker}.", ephemeral=True)
+            await interaction.followup.send(f"Could not fetch price for {ticker}.", ephemeral=True)
             return
-        ok = record_trade(ticker, action, shares, price, trade_time=time.strip() if time.strip() else None)
+        ok = record_trade(ticker, action, shares, price, trade_time=trade_time)
         if not ok:
             await interaction.followup.send(f"Cannot sell {ticker} — not in ledger.", ephemeral=True)
             return
@@ -227,7 +233,7 @@ class QueryCog(commands.Cog):
     @app_commands.check(trader_check)
     async def cmd_bulk_trade(self, interaction: discord.Interaction, block: str):
         await interaction.response.defer()
-        from engine import record_trade, load_competition_ledger, _get_price
+        from engine import record_trade, load_competition_ledger, _get_price, _get_price_at
         lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
         results = []
         for line in lines:
@@ -246,7 +252,12 @@ class QueryCog(commands.Cog):
             if action not in ("buy", "sell") or shares <= 0:
                 results.append(f"`{line}` — SKIP (action must be buy/sell, shares > 0)")
                 continue
-            price = _get_price(ticker)
+            if time_arg.strip():
+                price = _get_price_at(ticker, time_arg.strip())
+                if price is None:
+                    price = _get_price(ticker)
+            else:
+                price = _get_price(ticker)
             if price is None or price <= 0:
                 results.append(f"`{ticker} {action.upper()} {shares}` — SKIP (no price)")
                 continue

@@ -946,6 +946,29 @@ def _get_price(ticker):
         return None
 
 
+def _get_price_at(ticker, time_str):
+    """Fetch historical price at a given HH:MM UTC time from today's 1m bars."""
+    try:
+        parts = time_str.replace(" ", "").split(":")
+        h, m = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        return None
+    today = datetime.date.today()
+    target = datetime.datetime(today.year, today.month, today.day, h, m, tzinfo=datetime.timezone.utc)
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1d", interval="1m")
+        if hist.empty:
+            return None
+        hist.index = hist.index.tz_convert("UTC")
+        idx = hist.index.get_indexer([target], method="nearest")
+        if idx[0] >= 0:
+            return float(hist["Close"].iloc[idx[0]])
+        return None
+    except Exception:
+        return None
+
+
 def _holdings_value(ledger):
     total = 0.0
     for ticker, pos in ledger["holdings"].items():
@@ -1077,15 +1100,23 @@ def compute_recommendations(predicted, ledger):
 
 # ── viz update ───────────────────────────────────────────────────────────
 
-def visualization_update():
+def visualization_update(record_chart=True):
     ledger = load_competition_ledger()
     portfolio_value = ledger["cash_balance"] + _holdings_value(ledger)
-    ledger["history"].append({
-        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "portfolio_value": round(portfolio_value, 2),
-    })
-    save_competition_ledger(ledger)
-    generate_competition_chart(ledger)
+    if record_chart:
+        ledger["history"].append({
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "portfolio_value": round(portfolio_value, 2),
+        })
+        MAX_HISTORY_POINTS = 500
+        if len(ledger["history"]) > MAX_HISTORY_POINTS:
+            ledger["history"] = ledger["history"][-MAX_HISTORY_POINTS:]
+        save_competition_ledger(ledger)
+        generate_competition_chart(ledger)
+    else:
+        if ledger["history"]:
+            ledger["history"][-1]["portfolio_value"] = round(portfolio_value, 2)
+        save_competition_ledger(ledger)
     return ledger
 
 
@@ -1303,6 +1334,7 @@ class EngineRunner:
         repair_news_cache(news_cache)
 
         last_viz_time = 0.0
+        last_chart_time = 0.0
         news_just_fetched_this_cycle = False
 
         while not self._stopped.is_set():
@@ -1376,7 +1408,10 @@ class EngineRunner:
             # ── Clock 3: 60-second visualization ──
             if now_ts - last_viz_time >= 60:
                 last_viz_time = now_ts
-                ledger = visualization_update()
+                record_chart = (now_ts - last_chart_time >= 300)
+                if record_chart:
+                    last_chart_time = now_ts
+                ledger = visualization_update(record_chart=record_chart)
                 self._update_status(holdings_count=len(ledger["holdings"]), portfolio_value=ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL)
 
                 # Rebuild dashboard with latest ledger data + stored prediction

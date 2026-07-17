@@ -663,7 +663,7 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
         lines.append(f"{'TOTAL':<8} {'':>6} {'':>7} ${total_val:>9.2f} ${total_val - total_cost:>+8.2f}")
         lines.append("```")
     lines.append("")
-    lines.append("**Predicted Allocation (next rebalance):**")
+    lines.append("**Recommendations:**")
     lines.append("```")
     lines.append(f"{'Ticker':<8} {'Rank':>6} {'Sent':>6} {'Base':>6} {'Dec':>5} {'Qty':>5}")
     dash = "-" * (8 + 6 + 6 + 6 + 5 + 5 + 5)
@@ -1463,7 +1463,8 @@ class EngineRunner:
                     with open(COMPETITION_PREDICTION_FILE, "r") as f:
                         predicted = json.load(f)
                 recs, display = compute_recommendations(predicted, ledger) if predicted else ([], [])
-                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now)
+                daily_allowed = check_daily_gate()
+                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=daily_allowed)
                 send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
 
             self._sleep_with_trigger(5)

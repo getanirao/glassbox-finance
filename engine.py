@@ -702,10 +702,22 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
     except Exception:
         pass
     if has_final_recs:
-        execute_by = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES))
+        if market_state == "MARKET_OPEN":
+            execute_by = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)
+        else:
+            eastern = zoneinfo.ZoneInfo("US/Eastern")
+            et_dt = et_now
+            next_open = et_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+            if et_dt >= next_open or et_dt.weekday() >= 5 or et_dt.strftime("%Y-%m-%d") in NYSE_FULL_DAY_CLOSURES_2026:
+                for d in range(14):
+                    candidate = next_open + datetime.timedelta(days=d)
+                    if candidate.weekday() < 5 and candidate.strftime("%Y-%m-%d") not in NYSE_FULL_DAY_CLOSURES_2026:
+                        next_open = candidate
+                        break
+            execute_by = next_open.astimezone(datetime.timezone.utc)
         ex_hhmm = execute_by.strftime("%H:%M")
         lines.append("")
-        lines.append(f"**EXECUTE BY {ex_hhmm} UTC**")
+        lines.append(f"**EXECUTE AT {ex_hhmm} UTC** (market {'open' if market_state == 'MARKET_OPEN' else 'opens'})")
         for rec in recs:
             if rec["action"] in ("BUY", "SELL"):
                 lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']} time:{ex_hhmm}`")
@@ -1441,7 +1453,7 @@ class EngineRunner:
                 ledger = load_competition_ledger()
                 recs, display = compute_recommendations(predicted, ledger)
                 daily_allowed = check_daily_gate()
-                has_final_recs = daily_allowed and market_state == "MARKET_OPEN"
+                has_final_recs = daily_allowed
 
                 payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=has_final_recs)
 
@@ -1450,8 +1462,7 @@ class EngineRunner:
                     self._update_status(last_run_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
                     print(f"  [Gate] Daily allocation window opened — recommendations issued.")
                 else:
-                    gate_status = "cooldown" if not daily_allowed else "waiting for market open"
-                    print(f"  [Gate] Prediction updated — gate {gate_status}.")
+                    print(f"  [Gate] Prediction updated — gate cooldown.")
 
                 send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
 

@@ -663,12 +663,41 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
         lines.append(f"{'TOTAL':<8} {'':>6} {'':>7} ${total_val:>9.2f} ${total_val - total_cost:>+8.2f}")
         lines.append("```")
     lines.append("")
-    lines.append("**Recommendations:**")
+    rec_map = {rec["ticker"]: rec for rec in recs}
+    actionables = [r for r in recs if r["action"] in ("BUY", "SELL")]
+    if has_final_recs and actionables:
+        if market_state == "MARKET_OPEN":
+            execute_by = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)
+            label = "now"
+        else:
+            eastern = zoneinfo.ZoneInfo("US/Eastern")
+            et_dt = et_now
+            next_open = et_dt.replace(hour=9, minute=30, second=0, microsecond=0)
+            if et_dt >= next_open or et_dt.weekday() >= 5 or et_dt.strftime("%Y-%m-%d") in NYSE_FULL_DAY_CLOSURES_2026:
+                for d in range(1, 14):
+                    candidate = next_open + datetime.timedelta(days=d)
+                    if candidate.weekday() < 5 and candidate.strftime("%Y-%m-%d") not in NYSE_FULL_DAY_CLOSURES_2026:
+                        next_open = candidate
+                        break
+            execute_by = next_open.astimezone(datetime.timezone.utc)
+            label = "market opens"
+        ex_hhmm = execute_by.strftime("%H:%M")
+        time_param = "" if market_state == "MARKET_OPEN" else f" time:{ex_hhmm}"
+        lines.append("")
+        lines.append(f"**Trade Plan — execute at {ex_hhmm} UTC** ({label})")
+        for rec in actionables:
+            lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']}{time_param}`")
+        lines.append(f"`/hold` for any HOLD positions to confirm")
+    held_only = (has_final_recs and not actionables)
+    if held_only:
+        lines.append("")
+        lines.append("**All positions held — no trades needed this cycle**")
+    lines.append("")
+    lines.append("**Scoreboard:**")
     lines.append("```")
     lines.append(f"{'Ticker':<8} {'Rank':>6} {'Sent':>6} {'Base':>6} {'Dec':>5} {'Qty':>5}")
     dash = "-" * (8 + 6 + 6 + 6 + 5 + 5 + 5)
     lines.append(dash)
-    rec_map = {rec["ticker"]: rec for rec in recs}
     for r in predicted:
         ticker = r["ticker"]
         score = r["adjusted_score"]
@@ -680,24 +709,6 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
         lines.append(f"{ticker:<8} {score:>6.1f} {sent:>+6.3f} {fund:>6.1f} {action:>5} {shares:>5}")
     lines.append(dash)
     lines.append("```")
-    if has_final_recs:
-        eastern = zoneinfo.ZoneInfo("US/Eastern")
-        et_dt = et_now
-        next_open = et_dt.replace(hour=9, minute=30, second=0, microsecond=0)
-        if et_dt >= next_open or et_dt.weekday() >= 5 or et_dt.strftime("%Y-%m-%d") in NYSE_FULL_DAY_CLOSURES_2026:
-            for d in range(1, 14):
-                candidate = next_open + datetime.timedelta(days=d)
-                if candidate.weekday() < 5 and candidate.strftime("%Y-%m-%d") not in NYSE_FULL_DAY_CLOSURES_2026:
-                    next_open = candidate
-                    break
-        execute_by = next_open.astimezone(datetime.timezone.utc)
-        ex_hhmm = execute_by.strftime("%H:%M")
-        lines.append("")
-        lines.append(f"**EXECUTE AT {ex_hhmm} UTC** (market opens)")
-        for rec in recs:
-            if rec["action"] in ("BUY", "SELL"):
-                lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']} time:{ex_hhmm}`")
-        lines.append(f"`/hold` for any HOLD positions to confirm")
     return "\n".join(lines)
 
 

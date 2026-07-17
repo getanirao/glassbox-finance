@@ -688,8 +688,7 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
         for rec in actionables:
             lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']}{time_param}`")
         lines.append(f"`/hold` for any HOLD positions to confirm")
-    held_only = (has_final_recs and not actionables)
-    if held_only:
+    if not actionables:
         lines.append("")
         lines.append("**All positions held — no trades needed this cycle**")
     lines.append("")
@@ -1471,8 +1470,8 @@ class EngineRunner:
                     with open(COMPETITION_PREDICTION_FILE, "r") as f:
                         predicted = json.load(f)
                 recs, display = compute_recommendations(predicted, ledger) if predicted else ([], [])
-                has_actionable = any(r["action"] in ("BUY", "SELL") for r in recs)
-                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=has_actionable)
+                daily_allowed = check_daily_gate()
+                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=daily_allowed)
                 send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
 
             self._sleep_with_trigger(5)

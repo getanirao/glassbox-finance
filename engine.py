@@ -9,6 +9,9 @@ import threading
 import shutil
 import zoneinfo
 import requests
+import logging
+_yf_logger = logging.getLogger('yfinance')
+_yf_logger.disabled = True
 import yfinance as yf
 import pandas as pd
 import matplotlib
@@ -906,8 +909,10 @@ def process_ticker(ticker, index, total, news_cache):
     net_sentiment, penalty, headlines, rolling_pos, rolling_neg, rolling_count, long_sent, long_pos, long_neg, long_count = sentiment_gate(yf.Ticker(ticker), ticker, news_cache, skip_fetch=True)
     if solvency_ok and net_sentiment < 0.0:
         print(f"  [{index}/{total}] [Semantic Analysis]: Computational linguistics detect high rhetorical negative sentiment across public news sources, indicating structural headline risk that down-weights our core fundamental asset valuation.")
-    adjusted_score = (health_score * penalty) if solvency_ok else health_score
-    print(f"  [{index}/{total}] {ticker} {status} (Score: {adjusted_score:.1f}/100, ValMult: {valuation_multiplier:.3f})")
+    momentum = _get_momentum(ticker)
+    momentum_multiplier = max(0.80, min(1.20, 1.0 + momentum * MOMENTUM_IMPACT))
+    adjusted_score = (health_score * penalty * momentum_multiplier) if solvency_ok else health_score * momentum_multiplier
+    print(f"  [{index}/{total}] {ticker} {status} (Score: {adjusted_score:.1f}/100, ValMult: {valuation_multiplier:.3f}, Mom: {momentum:+.4f})")
     return {
         "ticker": ticker,
         "passed": solvency_ok,
@@ -918,6 +923,7 @@ def process_ticker(ticker, index, total, news_cache):
         "debt_to_equity": dte,
         "sentiment": net_sentiment,
         "penalty": penalty,
+        "momentum": momentum,
         "adjusted_score": adjusted_score,
         "valuation_multiplier": valuation_multiplier,
         "top_headline": headlines[0] if headlines else "No headlines available.",
@@ -937,13 +943,26 @@ def process_ticker(ticker, index, total, news_cache):
 def _get_price(ticker):
     try:
         stock = yf.Ticker(ticker)
-        price = stock.fast_info.last_price
-        if price is None or price <= 0:
-            hist = stock.history(period="1d")
-            price = hist["Close"].iloc[-1] if not hist.empty else None
-        return price
+        return stock.fast_info.last_price
     except Exception:
         return None
+
+
+def _get_momentum(ticker):
+    """Compute 5d vs 20d SMA crossover momentum. Returns -1.0 to 1.0, or 0.0 on failure."""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1mo")
+        if hist.empty or len(hist) < 5:
+            return 0.0
+        closes = hist["Close"]
+        short_ma = closes.tail(5).mean()
+        long_ma = closes.tail(20).mean() if len(closes) >= 20 else closes.mean()
+        if long_ma <= 0:
+            return 0.0
+        return max(-1.0, min(1.0, (short_ma - long_ma) / long_ma))
+    except Exception:
+        return 0.0
 
 
 def _get_price_at(ticker, time_str):
@@ -1057,44 +1076,57 @@ def compute_recommendations(predicted, ledger):
     cash = ledger["cash_balance"]
     recs = []
 
-    buy_candidates = eligible[:MAX_BUYS_PER_CYCLE]
-    capped = capped_score_weights(buy_candidates)
-    affordable_buy_tickers = set()
-    if capped:
-        for r in buy_candidates:
-            ticker = r["ticker"]
-            price = _get_price(ticker)
-            alloc = cash * capped[ticker]
-            target_shares = int(alloc / price) if price and price > 0 else 0
-            if target_shares == 0:
-                continue
-            affordable_buy_tickers.add(ticker)
-            recs.append({"ticker": ticker, "action": "BUY", "target_shares": target_shares, "price": price})
-
-    for r in eligible[MAX_BUYS_PER_CYCLE:]:
-        ticker = r["ticker"]
-        if ticker in ledger["holdings"]:
-            price = _get_price(ticker)
-            recs.append({"ticker": ticker, "action": "HOLD", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
-
+    # Stop-loss: SELL holdings down > STOP_LOSS_PERCENT from avg_price
+    stop_loss_tickers = set()
     for ticker in list(ledger["holdings"].keys()):
+        pos = ledger["holdings"][ticker]
+        price = _get_price(ticker)
+        if price and price > 0:
+            loss_pct = (price - pos["avg_price"]) / pos["avg_price"]
+            if loss_pct < -STOP_LOSS_PERCENT:
+                recs.append({"ticker": ticker, "action": "SELL", "target_shares": pos["shares"], "price": price})
+                stop_loss_tickers.add(ticker)
+
+    # SELL holdings with negative sentiment (not already stop-loss)
+    for ticker in list(ledger["holdings"].keys()):
+        if ticker in stop_loss_tickers:
+            continue
         if ticker not in eligible_tickers:
             price = _get_price(ticker)
             recs.append({"ticker": ticker, "action": "SELL", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
 
-    # HOLD for held tickers that are buy-eligible but unaffordable
-    for r in buy_candidates:
-        ticker = r["ticker"]
-        if ticker in ledger["holdings"] and ticker not in affordable_buy_tickers:
-            price = _get_price(ticker)
-            recs.append({"ticker": ticker, "action": "HOLD", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
+    # Pick top 2 eligible non-stop-loss tickers: 60/40 split
+    live_eligible = [r for r in eligible if r["ticker"] not in stop_loss_tickers]
+    buy_tickers = []
+    if live_eligible:
+        splits = [(cash * 0.6, live_eligible[0]), (cash * 0.4, live_eligible[1])] if len(live_eligible) >= 2 else [(cash, live_eligible[0])]
+        for alloc, candidate in splits:
+            price = _get_price(candidate["ticker"])
+            if price and price > 0:
+                target_shares = int(alloc / price)
+                if target_shares > 0:
+                    recs.append({"ticker": candidate["ticker"], "action": "BUY", "target_shares": target_shares, "price": price})
+                    buy_tickers.append(candidate["ticker"])
 
-    buy_tickers = {r["ticker"] for r in recs if r["action"] == "BUY"}
-    held_tickers = set(ledger["holdings"].keys())
-    display_list = [r for r in buy_candidates if r["ticker"] in buy_tickers]
+    # HOLD for remaining held tickers (not stop-loss, not negative sentiment, not in buy list)
     for r in predicted:
-        if r["ticker"] in held_tickers and r["ticker"] not in buy_tickers:
-            display_list.append(r)
+        ticker = r["ticker"]
+        if ticker not in ledger["holdings"]:
+            continue
+        if ticker in stop_loss_tickers:
+            continue
+        if ticker not in eligible_tickers:
+            continue  # Already handled as SELL above
+        if ticker in buy_tickers:
+            continue  # Already being bought more
+        price = _get_price(ticker)
+        recs.append({"ticker": ticker, "action": "HOLD", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
+
+    # Display: buy tickers + all held tickers, in rank order
+    display_tickers = set(buy_tickers)
+    for t in ledger["holdings"]:
+        display_tickers.add(t)
+    display_list = [r for r in predicted if r["ticker"] in display_tickers]
     return recs, display_list
 
 

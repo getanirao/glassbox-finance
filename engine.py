@@ -680,27 +680,6 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
         lines.append(f"{ticker:<8} {score:>6.1f} {sent:>+6.3f} {fund:>6.1f} {action:>5} {shares:>5}")
     lines.append(dash)
     lines.append("```")
-    # Next rebalance estimate
-    try:
-        with open(GATE_FILE) as _gf:
-            _last = datetime.datetime.fromisoformat(_gf.read().strip())
-        if _last.tzinfo is None:
-            _last = _last.replace(tzinfo=datetime.timezone.utc)
-        _next = _last + datetime.timedelta(hours=GATE_HOURS)
-        _now_utc = datetime.datetime.now(datetime.timezone.utc)
-        if _next > _now_utc:
-            _remaining = (_next - _now_utc).total_seconds()
-            _mins = int(_remaining // 60)
-            lines.append(f"")
-            lines.append(f"**Next rebalance ~{_mins} min** ({_next.strftime('%H:%M UTC')})")
-        elif market_state != "MARKET_OPEN":
-            lines.append("")
-            lines.append("**Next rebalance: next market open**")
-        else:
-            lines.append("")
-            lines.append("**Next rebalance: now**")
-    except Exception:
-        pass
     if has_final_recs:
         if market_state == "MARKET_OPEN":
             execute_by = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)

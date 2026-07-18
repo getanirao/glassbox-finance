@@ -233,7 +233,7 @@ class QueryCog(commands.Cog):
     @app_commands.check(trader_check)
     async def cmd_bulk_trade(self, interaction: discord.Interaction, block: str):
         await interaction.response.defer()
-        from engine import record_trade, load_competition_ledger, _get_price, _get_price_at
+        from engine import record_trade, record_hold, load_competition_ledger, _get_price, _get_price_at
         lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
         results = []
         for line in lines:
@@ -249,8 +249,12 @@ class QueryCog(commands.Cog):
                 results.append(f"`{line}` — SKIP (invalid shares)")
                 continue
             time_arg = parts[3] if len(parts) >= 4 else ""
+            if action == "hold":
+                record_hold(ticker)
+                results.append(f"`{ticker} HOLD {shares}` — OK")
+                continue
             if action not in ("buy", "sell") or shares <= 0:
-                results.append(f"`{line}` — SKIP (action must be buy/sell, shares > 0)")
+                results.append(f"`{line}` — SKIP (action must be buy/sell/hold, shares > 0)")
                 continue
             if time_arg.strip():
                 price = _get_price_at(ticker, time_arg.strip())
@@ -296,7 +300,7 @@ class QueryCog(commands.Cog):
             f"`/history` — Portfolio value history (last 20)",
             f"`/chart` — Performance chart image",
             f"`/trade` — Log a real buy/sell (ticker, buy/sell, shares — price fetched live)",
-            f"`/bulk-trade` — Pasted block of trades (one `TICKER ACTION SHARES` per line)",
+            f"`/bulk-trade` — Pasted block of trades (one `TICKER ACTION SHARES [TIME]` per line; actions: buy/sell/hold)",
             f"`/hold` — Confirm a HOLD recommendation (ticker)",
             f"`/help` — This message",
             f"",

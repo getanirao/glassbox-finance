@@ -1101,6 +1101,17 @@ def compute_recommendations(predicted, ledger):
     cash = ledger["cash_balance"]
     recs = []
 
+    # Load full prediction data for sentiment lookup on all tickers
+    _all_pred = []
+    try:
+        import os
+        if os.path.exists(COMPETITION_PREDICTION_FILE):
+            with open(COMPETITION_PREDICTION_FILE) as _f:
+                _all_pred = json.load(_f)
+    except Exception:
+        _all_pred = []
+    _sentiment_map = {p["ticker"]: p.get("sentiment", 0) for p in _all_pred}
+
     # Stop-loss: SELL holdings down > STOP_LOSS_PERCENT from avg_price
     stop_loss_tickers = set()
     for ticker in list(ledger["holdings"].keys()):
@@ -1112,11 +1123,11 @@ def compute_recommendations(predicted, ledger):
                 recs.append({"ticker": ticker, "action": "SELL", "target_shares": pos["shares"], "price": price})
                 stop_loss_tickers.add(ticker)
 
-    # SELL holdings with negative sentiment (not already stop-loss)
+    # SELL holdings with genuinely negative sentiment (not already stop-loss)
     for ticker in list(ledger["holdings"].keys()):
         if ticker in stop_loss_tickers:
             continue
-        if ticker not in eligible_tickers:
+        if _sentiment_map.get(ticker, 0) < 0:
             price = _get_price(ticker)
             recs.append({"ticker": ticker, "action": "SELL", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
 

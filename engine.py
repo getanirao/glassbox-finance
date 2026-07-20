@@ -959,12 +959,18 @@ def process_ticker(ticker, index, total, news_cache):
 
 # ── chart ────────────────────────────────────────────────────────────────
 
+_last_live_price = {}
+
 def _get_price(ticker):
     try:
         stock = yf.Ticker(ticker)
-        return stock.fast_info.last_price
+        price = stock.fast_info.last_price
+        if price and price > 0:
+            _last_live_price[ticker] = price
+            return price
+        return _last_live_price.get(ticker)
     except Exception:
-        return None
+        return _last_live_price.get(ticker)
 
 
 def _get_momentum(ticker):
@@ -1012,7 +1018,7 @@ def _holdings_value(ledger):
     for ticker, pos in ledger["holdings"].items():
         price = _get_price(ticker)
         if price is None or price <= 0:
-            price = pos["avg_price"]
+            price = _last_live_price.get(ticker, pos["avg_price"])
         total += pos["shares"] * price
     return total
 

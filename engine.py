@@ -1488,7 +1488,7 @@ class EngineRunner:
                         predicted = json.load(f)
                 recs, display = compute_recommendations(predicted, ledger) if predicted else ([], [])
                 daily_allowed = check_daily_gate()
-                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=daily_allowed)
+                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=True)
                 send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
 
             self._sleep_with_trigger(5)

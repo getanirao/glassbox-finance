@@ -61,6 +61,43 @@ docker compose up -d --build
 docker compose logs -f --tail 100
 ```
 
+## Optional MarketWatch Bridge
+
+The passive browser bridge requires a dedicated public HTTPS hostname. Keep the Docker port loopback-bound and let a TLS reverse proxy be the only public entry point.
+
+1. Add these values to the server `.env` file:
+
+```env
+MARKETWATCH_SYNC_ENABLED=true
+MARKETWATCH_SYNC_BIND_ADDRESS=127.0.0.1
+MARKETWATCH_SYNC_PORT=8765
+MARKETWATCH_SYNC_TOKEN=<at-least-32-random-characters>
+MARKETWATCH_GAME_SLUG=wolves-of-wall-street---july-2026
+```
+
+Generate the token on the server with `openssl rand -hex 32`. Do not reuse the Discord bot token or webhook URL.
+
+2. Point a hostname such as `bridge.example.com` at the VM and configure Caddy on the host:
+
+```caddyfile
+bridge.example.com {
+    reverse_proxy 127.0.0.1:8765
+}
+```
+
+Caddy obtains and renews TLS certificates automatically once DNS and ports 80/443 are available. Do not open port 8765 in the OCI security list or host firewall.
+
+3. Rebuild and verify the receiver:
+
+```bash
+docker compose up -d --build
+curl --fail https://bridge.example.com/v1/marketwatch/health
+```
+
+4. Load `marketwatch-bridge` as an unpacked extension in Chrome, configure its options with `https://bridge.example.com` and the bridge token, then open the signed-in Wolves Portfolio page. The first successful snapshot establishes a no-trade baseline. Do not rely on executable Glassbox instructions until the page badge and Discord dashboard both report `healthy`.
+
+If the bridge reports a cash/share mismatch, it intentionally blocks final recommendations; inspect the MarketWatch activity table and Glassbox ledger before clearing or re-baselining.
+
 ## Optional Local News Worker
 
 The main container already runs the news cycle. If you want an additional local worker sharing the same Docker volume, enable the worker profile:

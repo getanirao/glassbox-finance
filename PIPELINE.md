@@ -1,3 +1,17 @@
+### 2026-07-27 20:39 (UTC)
+- **Change:** Added a passive MarketWatch-to-Glassbox bridge, including an authenticated fail-closed receiver, durable browser outbox, timestamp-preserving activity replay, reconciliation state, dashboard gating, and loopback-only Docker exposure.
+- **Reason:** The Wolves workflow needs MarketWatch to remain the sole execution surface while Glassbox receives durable, original-time trade context without Discord commands or speculative position inference.
+- **Files:** `marketwatch_sync.py`, `marketwatch-bridge/`, `engine.py`, `config.py`, `main.py`, `docker-compose.yml`, `Dockerfile`, `.env.example`, `README.md`, `ORACLE_ALWAYS_FREE_SETUP.md`, `history/LOG_ARCHIVE_V4.md`, `PIPELINE.md`
+
+---
+
+### 2026-07-27 19:54 (UTC)
+- **Change:** Hardened competition-state reset, cache persistence, recommendation gating/sizing, exit tracking, Discord authorization, manual trade validation, and optional article summarization.
+- **Reason:** The competition readiness audit found stale-cache restoration, reset races, unconstrained ledger mutations, ineffective allocation limits, repeated partial exits, and documentation/runtime drift.
+- **Files:** `config.py`, `engine.py`, `bot.py`, `main.py`, `summarizer.py`, `Dockerfile`, `.env.example`, `README.md`, `sandbox.ps1`, `history/LOG_ARCHIVE_V3.md`, `PIPELINE.md`
+
+---
+
 ### Entry 36 — 2026-07-27
 
 **Action:** Added trailing trim and profit-taking exit rules to prevent steady portfolio bleed from loser positions.
@@ -140,61 +154,4 @@
 
 ---
 
-### Entry 28 — 2026-07-12T16:00:00Z
-
-**Action:** Added ROE + P/E (or P/B for banks) valuation multiplier to ticker scoring pipeline.
-
-**Changes:**
-- **Added** valuation multiplier in `process_ticker()` after solvency evaluation, before sentiment penalty
-- ROE factor: `max(0.5, min(1.5, roe / 0.20))` — 20% ROE = 1.0× par, capped 0.5–1.5×
-- **Non-banks** (70 tickers): P/E blended 50/50 with ROE — P/E <5→0.7, 5–10→0.9, 10–20→1.0, 20–40→0.9, >40→0.8
-- **Banks** (JPM, GS, BAC, MS, C): P/B blended 70/30 with ROE — P/B <0.8→0.8, 0.8–1.0→0.9, 1.0–1.5→1.0, 1.5–2.0→0.9, >2.0→0.85
-- Added `valuation_multiplier` to return dict and status print for dashboard visibility
-- Research-backed: Novy-Marx (2013, 4,000+ citations) confirms profitability and value are complementary (~0.1 correlation). Equal-weight (50/50) per academic consensus avoids overfitting. Banks use P/B per Investopedia/BankSift/BIS guidance.
-
-**Files Touched:** `engine.py`, `PIPELINE.md`, `README.md`
-
----
-
-### Entry 27 — 2026-07-12T09:00:00Z
-
-**Action:** Stripped SANDBOX mode and observation state machine; competition-only architecture with real trade logging.
-
-**Changes:**
-- **Removed** SANDBOX mode entirely — dropped `load_sandbox_ledger`, `save_sandbox_ledger`, `sandbox_execute`, `display_portfolio_table`, `build_sandbox_status`, `build_master_payload`, `send_master_report`
-- **Removed** observation state machine — dropped `load_observation_state`, `save_observation_state`, `collect_spot_prices`, `compute_volatility_spread`, `volatility_stabilized`, `OBSERVATION_FILE`
-- **Added** competition ledger infrastructure — `load_competition_ledger()`, `save_competition_ledger()`, `record_trade()`, `record_hold()` in `engine.py`
-- **Added** competition dashboard — `build_competition_dashboard()`, `send_or_update_comp_dashboard()`, `generate_competition_chart()`, `COMPETITION_CHART`, `COMPETITION_MESSAGE_STATE`, `COMPETITION_PREDICTION_FILE`
-- **Added** `/trade` (ticker, buy/sell, shares, price) and `/hold` (ticker) slash commands to `bot.py`
-- **Unified** `_run_loop()` to single COMPETITION path: 60-min news + full eval always runs regardless of market state, 60-sec viz loop updates portfolio value + chart + dashboard
-- **Final recommendations** issued only when gate expired + market open, with `EXECUTE BY HH:MM UTC` timestamp and `/trade` command template
-- **Fixed** `INSTITUTIONAL_BANKS` undefined bug — added `{"JPM","GS","BAC","MS","C"}` to `config.py`
-- **Tuned** time constants: `LONG_WINDOW_HOURS 168→504`, `DECAY_HALF_LIFE_HOURS 72→336`
-- **Updated** `handle_reset()` to clear competition state files + chart
-
-**Files Touched:** `config.py`, `engine.py`, `bot.py`, `PIPELINE.md`, `README.md`
-
----
-
-### Entry 26 — 2026-07-12T08:35:00Z
-
-**Action:** Replaced hardcoded sentiment lexicons with Loughran-McDonald Master Dictionary (Journal of Finance, 2011).
-
-**Changes:**
-- Created `lexicon.py` — auto-generated module with 380 positive words (347 from LM + 33 headline additions) and 2364 negative words (2345 from LM + 19 headline additions).
-- Reduced `config.py` — removed hardcoded POSITIVE_LEXICON, NEGATIVE_LEXICON, CRITICAL_NEGATIVE_LEXICON sets; now imports from `lexicon.py`.
-- Updated `Dockerfile` to COPY `lexicon.py` into the image.
-- Kept custom `CRITICAL_NEGATIVE_LEXICON` (10 words) for the weight boost mechanism — unchanged.
-- `gen_lexicon.py` preserved in repo for reproducibility.
-
-**Impact:**
-- Old lexicon: ~96 words (44 positive, 52 negative).
-- New lexicon: ~2744 words (380 positive, 2364 negative) — **28× larger**.
-- 154 cache headlines auto-corrected on first boot with expanded detection.
-- Words like "abandon", "impair", "litigation", "restate" now caught — previously missed entirely.
-
-**Files Touched:** `lexicon.py` (new), `config.py`, `Dockerfile`, `gen_lexicon.py` (new), `PIPELINE.md`, `README.md`
-
----
-
-_Older logs archived in /history/LOG_ARCHIVE_V2.md_
+_Older logs archived in /history/LOG_ARCHIVE_V4.md_

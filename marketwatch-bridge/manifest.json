@@ -1,0 +1,21 @@
+{
+  "manifest_version": 3,
+  "name": "Glassbox MarketWatch Bridge",
+  "description": "Passively reconciles the Wolves of Wall Street portfolio with Glassbox Finance.",
+  "version": "1.0.0",
+  "permissions": ["alarms", "storage"],
+  "host_permissions": ["https://www.marketwatch.com/*"],
+  "optional_host_permissions": ["https://*/*"],
+  "background": {
+    "service_worker": "service-worker.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.marketwatch.com/games/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "options_page": "options.html"
+}

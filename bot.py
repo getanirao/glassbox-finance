@@ -1,4 +1,5 @@
 import os
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -40,12 +41,17 @@ class GlassboxBot(commands.Bot):
             print(f"  [Bot] Slash commands synced (global + {len(self.guilds)} guild(s)).")
 
 
+def _has_role(interaction: discord.Interaction, *role_names: str) -> bool:
+    roles = getattr(interaction.user, "roles", [])
+    return any(getattr(role, "name", None) in role_names for role in roles)
+
+
 def admin_check(interaction: discord.Interaction) -> bool:
-    return True
+    return _has_role(interaction, DISCORD_ADMIN_ROLE)
 
 
 def trader_check(interaction: discord.Interaction) -> bool:
-    return True
+    return _has_role(interaction, DISCORD_ADMIN_ROLE, DISCORD_TRADER_ROLE)
 
 
 # ── Engine Cog ───────────────────────────────────────────────────────────
@@ -116,15 +122,25 @@ class EngineCog(commands.Cog):
     @app_commands.command(name="clear", description="Purge news cache, state files, and reset engine")
     @app_commands.check(admin_check)
     async def cmd_clear(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         engine = self.bot.engine
         if engine:
-            engine.pause()
+            stopped_at_boundary = await asyncio.to_thread(engine.pause_and_wait)
+            if not stopped_at_boundary:
+                await interaction.followup.send("Reset aborted: engine did not reach a safe cycle boundary.", ephemeral=True)
+                return
         from engine import handle_reset
-        handle_reset()
-        if engine:
-            engine.clear_trigger()
-            engine.resume()
-        await interaction.response.send_message("State files cleared. Ready for fresh run.", ephemeral=False)
+        try:
+            await asyncio.to_thread(handle_reset)
+        except RuntimeError as exc:
+            await interaction.followup.send(f"Reset aborted: {exc}", ephemeral=True)
+            return
+        finally:
+            if engine:
+                engine.request_state_reload()
+                engine.clear_trigger()
+                engine.resume()
+        await interaction.followup.send("State files cleared. Engine will reload a fresh cache before its next cycle.", ephemeral=True)
 
 # ── Query Cog ────────────────────────────────────────────────────────────
 
@@ -194,9 +210,9 @@ class QueryCog(commands.Cog):
 
     @app_commands.command(name="trade", description="Log a real trade for the competition ledger")
     @app_commands.check(trader_check)
-    async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int, time: str = ""):
+    async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int, price: float, time: str = ""):
         await interaction.response.defer()
-        from engine import record_trade, load_competition_ledger, _get_price, _get_price_at
+        from engine import record_trade
         ticker = ticker.upper()
         action = action.lower()
         if action not in ("buy", "sell"):
@@ -205,21 +221,11 @@ class QueryCog(commands.Cog):
         if shares <= 0:
             await interaction.followup.send("Shares must be positive.", ephemeral=True)
             return
-        trade_time = time.strip() if time.strip() else None
-        if trade_time:
-            price = _get_price_at(ticker, trade_time)
-            if price is None:
-                price = _get_price(ticker)
-        else:
-            price = _get_price(ticker)
-        if price is None or price <= 0:
-            await interaction.followup.send(f"Could not fetch price for {ticker}.", ephemeral=True)
+        try:
+            ledger = record_trade(ticker, action, shares, price, trade_time=time.strip() or None)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
             return
-        ok = record_trade(ticker, action, shares, price, trade_time=trade_time)
-        if not ok:
-            await interaction.followup.send(f"Cannot sell {ticker} — not in ledger.", ephemeral=True)
-            return
-        ledger = load_competition_ledger()
         pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else 0
         ts = time if time else ledger["history"][-1]["timestamp"]
         lines = [
@@ -233,41 +239,39 @@ class QueryCog(commands.Cog):
     @app_commands.check(trader_check)
     async def cmd_bulk_trade(self, interaction: discord.Interaction, block: str):
         await interaction.response.defer()
-        from engine import record_trade, record_hold, load_competition_ledger, _get_price, _get_price_at
+        from engine import record_trade, record_hold, load_competition_ledger
         lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
         results = []
         for line in lines:
             parts = line.split()
-            if len(parts) < 3:
-                results.append(f"`{line}` — SKIP (need: TICKER ACTION SHARES [TIME])")
+            if len(parts) < 2:
+                results.append(f"`{line}` — SKIP (need: TICKER ACTION SHARES PRICE [TIME])")
                 continue
             ticker = parts[0].upper()
             action = parts[1].lower()
+            if action == "hold":
+                if record_hold(ticker):
+                    results.append(f"`{ticker} HOLD` — OK")
+                else:
+                    results.append(f"`{ticker} HOLD` — SKIP (not in ledger)")
+                continue
+            if len(parts) < 4:
+                results.append(f"`{line}` — SKIP (need: TICKER ACTION SHARES PRICE [TIME])")
+                continue
             try:
                 shares = int(parts[2])
+                price = float(parts[3])
             except ValueError:
-                results.append(f"`{line}` — SKIP (invalid shares)")
+                results.append(f"`{line}` — SKIP (invalid shares or price)")
                 continue
-            time_arg = parts[3] if len(parts) >= 4 else ""
-            if action == "hold":
-                record_hold(ticker)
-                results.append(f"`{ticker} HOLD {shares}` — OK")
-                continue
+            time_arg = parts[4] if len(parts) >= 5 else ""
             if action not in ("buy", "sell") or shares <= 0:
                 results.append(f"`{line}` — SKIP (action must be buy/sell/hold, shares > 0)")
                 continue
-            if time_arg.strip():
-                price = _get_price_at(ticker, time_arg.strip())
-                if price is None:
-                    price = _get_price(ticker)
-            else:
-                price = _get_price(ticker)
-            if price is None or price <= 0:
-                results.append(f"`{ticker} {action.upper()} {shares}` — SKIP (no price)")
-                continue
-            ok = record_trade(ticker, action, shares, price, trade_time=time_arg.strip() if time_arg.strip() else None)
-            if not ok:
-                results.append(f"`{ticker} SELL {shares}` — SKIP (not in ledger)")
+            try:
+                record_trade(ticker, action, shares, price, trade_time=time_arg.strip() or None)
+            except ValueError as exc:
+                results.append(f"`{ticker} {action.upper()} {shares}` — SKIP ({exc})")
                 continue
             results.append(f"`{ticker} {action.upper()} {shares} @ ${price:.2f}` — OK")
         ledger = load_competition_ledger()
@@ -286,8 +290,10 @@ class QueryCog(commands.Cog):
     async def cmd_hold(self, interaction: discord.Interaction, ticker: str):
         from engine import record_hold
         ticker = ticker.upper()
-        record_hold(ticker)
-        await interaction.response.send_message(f"HOLD confirmed for {ticker}.", ephemeral=False)
+        if record_hold(ticker):
+            await interaction.response.send_message(f"HOLD confirmed for {ticker}.", ephemeral=False)
+        else:
+            await interaction.response.send_message(f"Cannot confirm HOLD for {ticker}: it is not in the ledger.", ephemeral=True)
 
     @app_commands.command(name="help", description="Show available commands and their usage")
     async def cmd_help(self, interaction: discord.Interaction):
@@ -299,8 +305,8 @@ class QueryCog(commands.Cog):
             f"`/news` — News cache summary with sentiment",
             f"`/history` — Portfolio value history (last 20)",
             f"`/chart` — Performance chart image",
-            f"`/trade` — Log a real buy/sell (ticker, buy/sell, shares — price fetched live)",
-            f"`/bulk-trade` — Pasted block of trades (one `TICKER ACTION SHARES [TIME]` per line; actions: buy/sell/hold)",
+            f"`/trade` — Log an executed buy/sell with its actual fill price",
+            f"`/bulk-trade` — One `TICKER ACTION SHARES PRICE [TIME]` per line; `TICKER HOLD` is also accepted",
             f"`/hold` — Confirm a HOLD recommendation (ticker)",
             f"`/help` — This message",
             f"",
@@ -310,6 +316,6 @@ class QueryCog(commands.Cog):
             f"`/stop` — Gracefully stop the engine (preserves cache)",
             f"`/clear` — Clear news cache, state files, and competition ledger",
             f"",
-            f"No role restrictions — all commands available to everyone.",
+            f"Trader role required for query/trade commands; Admin role required for engine controls.",
         ]
         await interaction.response.send_message("\n".join(lines), ephemeral=False)

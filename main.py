@@ -21,8 +21,6 @@ def parse_args():
         description="Glassbox Finance — Wolves of Wall Street",
         add_help=True,
     )
-    parser.add_argument("--sandbox", action="store_true",
-                        help="Run in SANDBOX mode")
     parser.add_argument("--comp", action="store_true",
                         help="Run in COMPETITION mode (default)")
     parser.add_argument("--clear", action="store_true",
@@ -47,12 +45,13 @@ def main():
     ensure_data_dir()
 
     if args.clear:
-        handle_reset()
+        try:
+            handle_reset()
+        except RuntimeError as exc:
+            print(f"  [Reset] {exc}")
+            sys.exit(1)
         sys.exit(0)
 
-    if args.sandbox and args.comp:
-        print("  Error: --sandbox and --comp are mutually exclusive.")
-        sys.exit(1)
     if (args.news_worker or args.news_worker_once) and (args.bot or args.bot_only or args.engine):
         print("  Error: news-worker modes cannot be combined with --bot, --bot-only, or --engine.")
         sys.exit(1)
@@ -62,16 +61,17 @@ def main():
         sys.exit(0)
 
     from config import RUN_MODE_FILE
-    if args.sandbox:
-        run_mode = "SANDBOX"
-    elif args.comp:
+    if args.comp:
         run_mode = "COMPETITION"
     elif os.path.exists(RUN_MODE_FILE):
         run_mode = open(RUN_MODE_FILE).read().strip()
     else:
         run_mode = os.environ.get("RUN_MODE", "COMPETITION")
+    if run_mode != "COMPETITION":
+        print(f"  [Mode] Ignoring unsupported mode '{run_mode}'; using COMPETITION.")
+        run_mode = "COMPETITION"
 
-    if not args.sandbox and not args.comp and not args.bot and not args.bot_only and not args.engine:
+    if not args.comp and not args.bot and not args.bot_only and not args.engine:
         print("\n  Glassbox Finance — Wolves of Wall Street")
         print("  " + "-" * 50)
         print("  Usage: python main.py [--comp] [--bot | --bot-only | --engine | --news-worker | --news-worker-once] [--clear]")
@@ -90,6 +90,11 @@ def main():
     engine_thread = None
     engine = None
     bot_task = None
+    sync_server = None
+
+    from marketwatch_sync import MarketWatchSyncServer
+    sync_server = MarketWatchSyncServer()
+    sync_server.start()
 
     if not args.bot_only:
         engine = EngineRunner(run_mode=run_mode)
@@ -126,6 +131,8 @@ def main():
 
     if engine:
         engine.stop()
+    if sync_server:
+        sync_server.stop()
     print(f"\n{'=' * 80}")
     print(f"                             ENGINE SYSTEM TERMINATED")
     print(f"{'=' * 80}")

@@ -22,8 +22,16 @@ services:
       <<: *glassbox-env
       BOT_TOKEN: ${BOT_TOKEN}
       WEBHOOK_URL: ${WEBHOOK_URL}
+      MARKETWATCH_SYNC_ENABLED: ${MARKETWATCH_SYNC_ENABLED:-false}
+      MARKETWATCH_SYNC_HOST: 0.0.0.0
+      MARKETWATCH_SYNC_PORT: 8765
+      MARKETWATCH_SYNC_TOKEN: ${MARKETWATCH_SYNC_TOKEN:-}
+      MARKETWATCH_GAME_SLUG: ${MARKETWATCH_GAME_SLUG:-wolves-of-wall-street---july-2026}
+      MARKETWATCH_SYNC_MAX_STALENESS_SECONDS: ${MARKETWATCH_SYNC_MAX_STALENESS_SECONDS:-300}
     volumes:
       - glassbox_data:/app/data
+    ports:
+      - "${MARKETWATCH_SYNC_BIND_ADDRESS:-127.0.0.1}:${MARKETWATCH_SYNC_PORT:-8765}:8765"
     stop_grace_period: 30s
     logging:
       driver: "json-file"

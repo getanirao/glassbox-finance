@@ -179,7 +179,7 @@ _PROVIDERS = {
 }
 
 
-def summarize(text, provider="openai", api_key=None):
+def summarize(text, provider="openai", api_key=None, max_chars=4000):
     """Send text to an LLM for financial summarization.
 
     Args:
@@ -192,6 +192,7 @@ def summarize(text, provider="openai", api_key=None):
     """
     if not text or len(text) < 100:
         return text
+    text = text[:max_chars]
 
     caller = _PROVIDERS.get(provider)
     if not caller:
@@ -231,7 +232,7 @@ def extract_article_lead(url, max_lines=3):
     return lead
 
 
-def summarize_article(url, provider="openai", api_key=None):
+def summarize_article(url, provider="openai", api_key=None, max_chars=4000):
     """Fetch article from URL and summarize it.
 
     Returns (summary_text, original_text) tuple, or (None, None) on failure.
@@ -239,5 +240,5 @@ def summarize_article(url, provider="openai", api_key=None):
     body = fetch_article(url)
     if not body:
         return None, None
-    summary = summarize(body, provider=provider, api_key=api_key)
+    summary = summarize(body, provider=provider, api_key=api_key, max_chars=max_chars)
     return summary, body

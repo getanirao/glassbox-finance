@@ -7,6 +7,7 @@ import re
 import random
 import threading
 import shutil
+import tempfile
 import zoneinfo
 import requests
 import logging
@@ -24,42 +25,87 @@ from config import *
 from sentiment import score_headline, get_scorer
 
 NEWS_LOCK_OWNER = f"{os.getpid()}:{datetime.datetime.now(datetime.timezone.utc).isoformat()}"
+COMPETITION_LEDGER_LOCK = threading.RLock()
+
+
+def log_sentiment_backend():
+    scorer = get_scorer()
+    scorer.score("market update")
+    if scorer.using_lm:
+        print("  [Sentiment] FinBERT ONNX model unavailable; using Loughran-McDonald fallback.")
 
 
 # ── helpers ──────────────────────────────────────────────────────────────
 
+def _read_json(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _write_json_atomic(path, payload):
+    """Write state files atomically so an interrupted save never truncates the live file."""
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, temp_path = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _valid_news_cache(data):
+    return isinstance(data, dict) and isinstance(data.get("headlines"), list)
+
+
+def _headline_key(ticker, text):
+    normalized = re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]", " ", text.lower())).strip()
+    return f"{ticker.upper()}|{normalized}"
+
+
+def _entry_timestamp(entry):
+    try:
+        timestamp = datetime.datetime.fromisoformat(entry["timestamp"])
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=datetime.timezone.utc)
+        return timestamp.astimezone(datetime.timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def load_news_cache():
     if os.path.exists(NEWS_CACHE_FILE):
-        with open(NEWS_CACHE_FILE, "r") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and "headlines" in data:
-            tickers_seen = set(h.get("ticker") for h in data["headlines"])
-            if len(tickers_seen) < 3 and os.path.exists(NEWS_CACHE_BACKUP):
-                print(f"  [Cache] Main cache has only {len(tickers_seen)} ticker(s); restoring from backup.")
-                with open(NEWS_CACHE_BACKUP, "r") as f:
-                    data = json.load(f)
-        return data
-    if os.path.exists(NEWS_CACHE_BACKUP):
-        print(f"  [Cache] Main cache missing; restoring from backup.")
-        with open(NEWS_CACHE_BACKUP, "r") as f:
-            return json.load(f)
+        data = _read_json(NEWS_CACHE_FILE)
+        if _valid_news_cache(data):
+            return data
+        print("  [Cache] Main cache is unreadable; attempting backup recovery.")
+        backup = _read_json(NEWS_CACHE_BACKUP)
+        if _valid_news_cache(backup):
+            return backup
+    # A missing main cache is an intentional fresh start. Do not resurrect a backup.
     return {"headlines": []}
 
 
 def save_news_cache(cache):
-    if isinstance(cache, dict) and "headlines" in cache:
-        tickers_seen = set(h.get("ticker") for h in cache["headlines"])
-        if len(tickers_seen) >= len(TICKERS) * 0.5:
-            if os.path.exists(NEWS_CACHE_FILE):
-                shutil.copy2(NEWS_CACHE_FILE, NEWS_CACHE_BACKUP)
-    with open(NEWS_CACHE_FILE, "w") as f:
-        json.dump(cache, f, indent=2)
+    if not _valid_news_cache(cache):
+        raise ValueError("News cache must contain a headlines list.")
+    tickers_seen = {h.get("ticker") for h in cache["headlines"] if isinstance(h, dict)}
+    if len(tickers_seen) >= len(TICKERS) * 0.5 and os.path.exists(NEWS_CACHE_FILE):
+        shutil.copy2(NEWS_CACHE_FILE, NEWS_CACHE_BACKUP)
+    _write_json_atomic(NEWS_CACHE_FILE, cache)
 
 
 def repair_news_cache(cache):
     fixed = 0
     for h in cache["headlines"]:
-        text = h.get("text", "")
+        text = h.get("scored_text") or h.get("text", "")
         net, pos, neg = score_headline(text)
         old_net = h.get("net_score", 0)
         if abs(old_net - net) > 0.001:
@@ -86,14 +132,27 @@ def prune_news_cache(cache):
     before = len(cache["headlines"])
     surviving = []
     for h in cache["headlines"]:
-        try:
-            ts = datetime.datetime.fromisoformat(h["timestamp"])
-        except (ValueError, KeyError):
+        ts = _entry_timestamp(h)
+        if ts is None:
             continue
         if ts >= cutoff:
             surviving.append(h)
-    cache["headlines"] = surviving
-    return before - len(surviving), window_hours
+    deduped = []
+    seen = set()
+    per_ticker = {}
+    for h in sorted(surviving, key=lambda item: _entry_timestamp(item), reverse=True):
+        ticker = str(h.get("ticker", "")).upper()
+        text = h.get("text", "")
+        if not ticker or not text:
+            continue
+        key = _headline_key(ticker, text)
+        if key in seen or per_ticker.get(ticker, 0) >= MAX_HEADLINES_PER_TICKER:
+            continue
+        seen.add(key)
+        per_ticker[ticker] = per_ticker.get(ticker, 0) + 1
+        deduped.append(h)
+    cache["headlines"] = list(reversed(deduped))
+    return before - len(cache["headlines"]), window_hours
 
 
 def compute_rolling_sentiment(entries, ticker, window_hours=None):
@@ -101,11 +160,11 @@ def compute_rolling_sentiment(entries, ticker, window_hours=None):
         window_hours = get_cache_window_hours()
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=window_hours)
     now = datetime.datetime.now(datetime.timezone.utc)
-    ticker_entries = [
-        h for h in entries
-        if h["ticker"] == ticker
-        and datetime.datetime.fromisoformat(h["timestamp"]) >= cutoff
-    ]
+    ticker_entries = []
+    for h in entries:
+        timestamp = _entry_timestamp(h)
+        if h.get("ticker") == ticker and timestamp is not None and timestamp >= cutoff:
+            ticker_entries.append(h)
     if not ticker_entries:
         return 0.0, 0, 0, 0
     name = TICKER_NAMES.get(ticker, "").lower()
@@ -114,7 +173,7 @@ def compute_rolling_sentiment(entries, ticker, window_hours=None):
     weighted_pos = 0.0
     weighted_neg = 0.0
     for h in ticker_entries:
-        age = now - datetime.datetime.fromisoformat(h["timestamp"])
+        age = now - _entry_timestamp(h)
         age_hours = age.total_seconds() / 3600
         weight = 0.5 ** (age_hours / DECAY_HALF_LIFE_HOURS)
         hl = h["text"].lower()
@@ -287,8 +346,8 @@ def release_stale_news_lock(max_age_minutes=NEWS_LOCK_STALE_MINUTES):
         return False
 
 
-def acquire_news_lock():
-    for attempt in range(5):
+def acquire_news_lock(attempts=5, retry_seconds=1):
+    for attempt in range(attempts):
         try:
             fd = os.open(NEWS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             with os.fdopen(fd, "w") as f:
@@ -299,8 +358,8 @@ def acquire_news_lock():
             return True
         except FileExistsError:
             release_stale_news_lock()
-        print(f"  [News] Lock held — retrying ({attempt + 1}/5)...")
-        time.sleep(1)
+        print(f"  [News] Lock held — retrying ({attempt + 1}/{attempts})...")
+        time.sleep(retry_seconds)
     print("  [News] Could not acquire lock.")
     return False
 
@@ -322,14 +381,16 @@ def release_news_lock():
 
 def load_competition_ledger():
     if os.path.exists(COMPETITION_LEDGER):
-        with open(COMPETITION_LEDGER, "r") as f:
-            return json.load(f)
+        ledger = _read_json(COMPETITION_LEDGER)
+        if isinstance(ledger, dict) and isinstance(ledger.get("holdings"), dict) and isinstance(ledger.get("history"), list):
+            ledger.setdefault("cash_balance", STARTING_CAPITAL)
+            return ledger
+        print("  [Ledger] Unreadable ledger; starting a new ledger rather than using corrupted balances.")
     return {"cash_balance": STARTING_CAPITAL, "holdings": {}, "history": []}
 
 
 def save_competition_ledger(ledger):
-    with open(COMPETITION_LEDGER, "w") as f:
-        json.dump(ledger, f, indent=2)
+    _write_json_atomic(COMPETITION_LEDGER, ledger)
 
 
 # ── fundamentals cache ──────────────────────────────────────────────────
@@ -349,48 +410,104 @@ def _save_fundamentals_cache(cache):
         json.dump(cache, f, indent=2)
 
 
-def record_trade(ticker, action, shares, price, trade_time=None):
+def _trade_timestamp(trade_time=None):
+    if not trade_time:
+        return datetime.datetime.now(datetime.timezone.utc).isoformat()
+    raw = trade_time.strip()
+    try:
+        if "T" in raw or raw.count("-") >= 2:
+            parsed = datetime.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc).isoformat()
+        h, m = (int(part) for part in raw.replace(" ", "").split(":"))
+        today = datetime.datetime.now(datetime.timezone.utc).date()
+        return datetime.datetime(today.year, today.month, today.day, h, m, tzinfo=datetime.timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        raise ValueError("Time must be HH:MM UTC or an ISO-8601 UTC timestamp.")
+
+
+def record_trade(ticker, action, shares, price, trade_time=None, source="manual", event_id=None):
+    with COMPETITION_LEDGER_LOCK:
+        return _record_trade_unlocked(ticker, action, shares, price, trade_time, source, event_id)
+
+
+def _record_trade_unlocked(ticker, action, shares, price, trade_time=None, source="manual", event_id=None):
+    ticker = str(ticker).upper()
+    action = str(action).lower()
+    if ticker not in TICKERS:
+        raise ValueError(f"{ticker} is not in the configured competition watchlist.")
+    if action not in ("buy", "sell"):
+        raise ValueError("Action must be buy or sell.")
+    if not isinstance(shares, int) or shares <= 0:
+        raise ValueError("Shares must be a positive whole number.")
+    if not isinstance(price, (int, float)) or not math.isfinite(price) or price <= 0:
+        raise ValueError("Price must be a positive finite number.")
+    if not isinstance(source, str) or not source.strip():
+        raise ValueError("Trade source must be a non-empty string.")
+    if event_id is not None and (not isinstance(event_id, str) or not event_id.strip() or len(event_id) > 160):
+        raise ValueError("Trade event ID must be a non-empty string up to 160 characters.")
+
     ledger = load_competition_ledger()
-    if trade_time:
-        try:
-            parts = trade_time.replace(" ", "").split(":")
-            h, m = int(parts[0]), int(parts[1])
-            today = datetime.date.today()
-            ts = datetime.datetime(today.year, today.month, today.day, h, m, tzinfo=datetime.timezone.utc).isoformat()
-        except (ValueError, IndexError):
-            ts = trade_time
-    else:
-        ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    ts = _trade_timestamp(trade_time)
     if action == "buy":
+        cost = shares * price
+        if cost > ledger["cash_balance"] + 0.01:
+            raise ValueError(f"Insufficient cash: need ${cost:,.2f}, have ${ledger['cash_balance']:,.2f}.")
         if ticker in ledger["holdings"]:
             pos = ledger["holdings"][ticker]
             total_cost = pos["shares"] * pos["avg_price"] + shares * price
             pos["shares"] += shares
             pos["avg_price"] = total_cost / pos["shares"]
+            pos["trim_executed"] = False
+            pos["profit_taken"] = False
         else:
-            ledger["holdings"][ticker] = {"shares": shares, "avg_price": price}
-        ledger["cash_balance"] -= shares * price
+            if len(ledger["holdings"]) >= MAX_PORTFOLIO_HOLDINGS:
+                raise ValueError(f"Portfolio already has {MAX_PORTFOLIO_HOLDINGS} holdings.")
+            ledger["holdings"][ticker] = {
+                "shares": shares,
+                "avg_price": price,
+                "trim_executed": False,
+                "profit_taken": False,
+            }
+        ledger["cash_balance"] -= cost
     elif action == "sell":
         if ticker not in ledger["holdings"]:
-            return False
+            raise ValueError(f"Cannot sell {ticker}: it is not in the ledger.")
         pos = ledger["holdings"][ticker]
-        if shares >= pos["shares"]:
+        if shares > pos["shares"]:
+            raise ValueError(f"Cannot sell {shares} {ticker} shares; ledger holds {pos['shares']}.")
+        gain_pct = (price - pos["avg_price"]) / pos["avg_price"]
+        if shares == pos["shares"]:
             del ledger["holdings"][ticker]
         else:
             pos["shares"] -= shares
+            if gain_pct <= -TRAILING_TRIM_PERCENT:
+                pos["trim_executed"] = True
+            if gain_pct >= PROFIT_TAKE_PERCENT:
+                pos["profit_taken"] = True
         ledger["cash_balance"] += shares * price
     portfolio_value = ledger["cash_balance"] + _holdings_value(ledger)
-    ledger["history"].append({
+    history_event = {
         "timestamp": ts,
         "portfolio_value": round(portfolio_value, 2),
         "event": f"{action.upper()} {shares} {ticker} @ ${price:.2f}",
-    })
+        "source": source.strip(),
+    }
+    if event_id:
+        history_event["event_id"] = event_id.strip()
+    ledger["history"].append(history_event)
     save_competition_ledger(ledger)
     generate_competition_chart(ledger)
-    return True
+    return ledger
 
 
 def record_hold(ticker):
+    with COMPETITION_LEDGER_LOCK:
+        return _record_hold_unlocked(ticker)
+
+
+def _record_hold_unlocked(ticker):
     ledger = load_competition_ledger()
     if ticker in ledger["holdings"]:
         if "confirmed_holds" not in ledger:
@@ -398,7 +515,30 @@ def record_hold(ticker):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         ledger["confirmed_holds"].append({"ticker": ticker, "timestamp": now})
         save_competition_ledger(ledger)
-    return True
+        return True
+    return False
+
+
+def marketwatch_sync_status():
+    """Return bridge health without making a remote call from the engine loop."""
+    if not MARKETWATCH_SYNC_ENABLED:
+        return {"enabled": False, "healthy": True, "status": "disabled"}
+    state = _read_json(MARKETWATCH_SYNC_FILE)
+    if not isinstance(state, dict):
+        return {"enabled": True, "healthy": False, "status": "awaiting_baseline"}
+    status = str(state.get("status", "awaiting_baseline"))
+    observed_at = _entry_timestamp({"timestamp": state.get("last_observed_at")})
+    if observed_at is None:
+        return {"enabled": True, "healthy": False, "status": "awaiting_baseline"}
+    age_seconds = (datetime.datetime.now(datetime.timezone.utc) - observed_at).total_seconds()
+    if age_seconds > MARKETWATCH_SYNC_MAX_STALENESS_SECONDS:
+        return {"enabled": True, "healthy": False, "status": "stale", "age_seconds": round(age_seconds)}
+    return {
+        "enabled": True,
+        "healthy": status == "healthy",
+        "status": status,
+        "age_seconds": round(max(0, age_seconds)),
+    }
 
 
 # ── webhook helpers ──────────────────────────────────────────────────────
@@ -602,7 +742,7 @@ def summarize_news_entry(ticker, headlines, rolling_sent, rolling_pos, rolling_n
         if last_space > 0:
             truncated = truncated[:last_space]
         best_h = truncated + "\u2026"
-    return f"{ticker} [{best_net:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> {best_h}"
+    return f"{ticker} [{rolling_sent:+.2f}] ({rolling_pos} P / {rolling_neg} N) -> {best_h}"
 
 
 def build_news_roundup(alerts, et_now):
@@ -622,7 +762,7 @@ def build_news_roundup(alerts, et_now):
         )
         lines.append(f"  {row}")
     lines.append("=" * 80)
-    lines.append(f"  {len(alerts)} headlines  |  24h Rolling Window  |  21d Trend Anchor")
+    lines.append(f"  {len(alerts)} tickers  |  {get_cache_window_hours()}h Rolling Window  |  21d Trend Anchor")
     lines.append("=" * 80)
     return "\n".join(lines)
 
@@ -636,6 +776,10 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
     lines.append(f"**Glassbox Finance — COMPETITION DASHBOARD**")
     lines.append(f"Market: {market_state}  |  {et_now.strftime('%Y-%m-%d %H:%M %Z')}")
     lines.append(f"Portfolio: **${pv:,.2f}** ({arrow}{change:,.2f} / {arrow}{pct:.2f}%)")
+    sync = marketwatch_sync_status()
+    if sync["enabled"]:
+        sync_label = "HEALTHY" if sync["healthy"] else f"BLOCKED ({sync['status']})"
+        lines.append(f"MarketWatch bridge: **{sync_label}**")
     if get_scorer().using_lm:
         lines.append("**:warning: SENTIMENT ENGINE DEGRADED — using dictionary fallback**")
     lines.append(f"Cash: ${ledger['cash_balance']:,.2f}  |  Holdings: {len(ledger['holdings'])} / {MAX_PORTFOLIO_HOLDINGS}")
@@ -666,29 +810,20 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
     rec_map = {rec["ticker"]: rec for rec in recs}
     actionables = [r for r in recs if r["action"] in ("BUY", "SELL")]
     if has_final_recs and actionables:
-        if market_state == "MARKET_OPEN":
-            execute_by = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)
-            label = "now"
-        else:
-            eastern = zoneinfo.ZoneInfo("US/Eastern")
-            et_dt = et_now
-            next_open = et_dt.replace(hour=9, minute=30, second=0, microsecond=0)
-            if et_dt >= next_open or et_dt.weekday() >= 5 or et_dt.strftime("%Y-%m-%d") in NYSE_FULL_DAY_CLOSURES_2026:
-                for d in range(1, 14):
-                    candidate = next_open + datetime.timedelta(days=d)
-                    if candidate.weekday() < 5 and candidate.strftime("%Y-%m-%d") not in NYSE_FULL_DAY_CLOSURES_2026:
-                        next_open = candidate
-                        break
-            execute_by = next_open.astimezone(datetime.timezone.utc)
-            label = "market opens"
+        execute_by = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)
         ex_hhmm = execute_by.strftime("%H:%M")
-        time_param = "" if market_state == "MARKET_OPEN" else f" time:{ex_hhmm}"
         lines.append("")
-        lines.append(f"**Trade Plan — execute at {ex_hhmm} UTC** ({label})")
+        lines.append(f"**Trade Plan — execute by {ex_hhmm} UTC**")
         for rec in actionables:
-            lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']}{time_param}`")
+            lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']} price:<actual_fill>`")
         lines.append(f"`/hold` for any HOLD positions to confirm")
-    if not actionables:
+    elif not has_final_recs:
+        lines.append("")
+        if sync["enabled"] and not sync["healthy"]:
+            lines.append("**Preview only — final trade instructions are blocked until MarketWatch sync is healthy.**")
+        else:
+            lines.append("**Preview only — final trade instructions unlock during the next market-open gate.**")
+    else:
         lines.append("")
         lines.append("**All positions held — no trades needed this cycle**")
     lines.append("")
@@ -723,14 +858,18 @@ def validate_statement(df, name):
 
 def evaluate_solvency(bs):
     try:
-        current_assets = bs.loc[bs.index.str.contains("Current Assets", case=False)].iloc[0, 0]
-        current_liabilities = bs.loc[bs.index.str.contains("Current Liabilities", case=False)].iloc[0, 0]
-        total_liabilities = bs.loc[bs.index.str.contains("Total Liabilities", case=False)].iloc[0, 0]
-        equity = bs.loc[bs.index.str.contains("Stockholders Equity|Stockholder Equity", case=False)].iloc[0, 0]
-    except (IndexError, KeyError, AttributeError):
+        current_assets = float(bs.loc[bs.index.str.contains("Current Assets", case=False)].iloc[0, 0])
+        current_liabilities = float(bs.loc[bs.index.str.contains("Current Liabilities", case=False)].iloc[0, 0])
+        total_debt = float(bs.loc[bs.index.str.contains("Total Debt", case=False)].iloc[0, 0])
+        equity = float(bs.loc[bs.index.str.contains("Stockholders Equity|Stockholder Equity", case=False)].iloc[0, 0])
+    except (IndexError, KeyError, AttributeError, TypeError, ValueError):
+        return None, None, None, None
+    if not all(math.isfinite(value) for value in (current_assets, current_liabilities, total_debt, equity)):
+        return None, None, None, None
+    if current_assets < 0 or current_liabilities <= 0 or total_debt < 0 or equity <= 0:
         return None, None, None, None
     current_ratio = current_assets / current_liabilities
-    d_to_e = total_liabilities / equity
+    d_to_e = total_debt / equity
     cr_score = min(1.0, current_ratio / 1.2)
     de_score = min(1.0, 1.5 / d_to_e)
     health_score = ((cr_score + de_score) / 2) * 100
@@ -740,6 +879,23 @@ def evaluate_solvency(bs):
 
 
 # ── sentiment ─────────────────────────────────────────────────────────────
+
+def _article_timestamp(content):
+    """Prefer the publisher timestamp so stale feed entries do not become newly relevant."""
+    for raw in (content.get("providerPublishTime"), content.get("pubDate"), content.get("displayTime")):
+        if raw is None:
+            continue
+        try:
+            if isinstance(raw, (int, float)):
+                return datetime.datetime.fromtimestamp(raw, tz=datetime.timezone.utc)
+            parsed = datetime.datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.astimezone(datetime.timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            continue
+    return datetime.datetime.now(datetime.timezone.utc)
+
 
 def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
     entries = news_cache["headlines"]
@@ -765,43 +921,49 @@ def sentiment_gate(stock, ticker, news_cache, skip_fetch=False):
         return short_sent, penalty, [], short_pos, short_neg, short_count, long_sent, long_pos, long_neg, long_count
     latest_headlines = []
     new_count = 0
+    seen_headlines = {
+        _headline_key(h.get("ticker", ""), h.get("text", ""))
+        for h in entries if isinstance(h, dict)
+    }
     for article in news_raw:
         content = article.get("content", {})
         title = content.get("title", "") if isinstance(content, dict) else ""
         if not title:
             continue
         latest_headlines.append(title)
-        already_seen = any(
-            h["text"] == title and h["ticker"] == ticker
-            for h in entries
-        )
-        if already_seen:
+        headline_key = _headline_key(ticker, title)
+        if headline_key in seen_headlines:
             continue
-        # Enrich headline with first few lines of article body for better context
         text_to_score = title
-        try:
-            url = (
-                (content.get("canonicalUrl") or {}).get("url")
-                or (content.get("clickThroughUrl") or {}).get("url")
-                or ""
-            )
-            if url:
-                from summarizer import extract_article_lead
-                lead = extract_article_lead(url, max_lines=3)
-                if lead:
-                    text_to_score = f"{title}. {lead}"
-        except Exception:
-            pass
+        url = (
+            (content.get("canonicalUrl") or {}).get("url")
+            or (content.get("clickThroughUrl") or {}).get("url")
+            or ""
+        )
+        if ENABLE_ARTICLE_SUMMARIZATION and url:
+            try:
+                from summarizer import summarize_article
+                summary, _ = summarize_article(
+                    url,
+                    provider=SUMMARIZE_PROVIDER,
+                    max_chars=SUMMARIZE_MAX_CHARS,
+                )
+                if summary:
+                    text_to_score = f"{title}. {summary}"
+            except Exception as exc:
+                print(f"  [{ticker}] Article summarization skipped: {exc}")
         net, pos_prob, neg_prob = score_headline(text_to_score)
         news_cache["headlines"].append({
             "text": title,
+            "scored_text": text_to_score,
             "ticker": ticker,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "timestamp": _article_timestamp(content).isoformat(),
             "pos_count": round(pos_prob, 4),
             "neg_count": round(neg_prob, 4),
             "critical_neg": 0,
             "net_score": round(net, 4),
         })
+        seen_headlines.add(headline_key)
         new_count += 1
     short_sent, short_pos, short_neg, short_count = compute_rolling_sentiment(entries, ticker)
     long_sent, long_pos, long_neg, long_count = compute_rolling_sentiment(entries, ticker, window_hours=LONG_WINDOW_HOURS)
@@ -990,29 +1152,6 @@ def _get_momentum(ticker):
         return 0.0
 
 
-def _get_price_at(ticker, time_str):
-    """Fetch historical price at a given HH:MM UTC time from today's 1m bars."""
-    try:
-        parts = time_str.replace(" ", "").split(":")
-        h, m = int(parts[0]), int(parts[1])
-    except (ValueError, IndexError):
-        return None
-    today = datetime.date.today()
-    target = datetime.datetime(today.year, today.month, today.day, h, m, tzinfo=datetime.timezone.utc)
-    try:
-        stock = yf.Ticker(ticker)
-        hist = stock.history(period="1d", interval="1m")
-        if hist.empty:
-            return None
-        hist.index = hist.index.tz_convert("UTC")
-        idx = hist.index.get_indexer([target], method="nearest")
-        if idx[0] >= 0:
-            return float(hist["Close"].iloc[idx[0]])
-        return None
-    except Exception:
-        return None
-
-
 def _holdings_value(ledger):
     total = 0.0
     for ticker, pos in ledger["holdings"].items():
@@ -1062,9 +1201,7 @@ def run_full_evaluation(news_cache):
                 passed_results.append(result)
         except Exception as e:
             print(f"  [{i}/{len(TICKERS)}] {ticker} ERROR - {e}")
-    save_news_cache(news_cache)
-    predicted = sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)[:MAX_PORTFOLIO_HOLDINGS]
-    return predicted
+    return sorted(passed_results, key=lambda x: x["adjusted_score"], reverse=True)
 
 
 def capped_score_weights(candidates):
@@ -1095,109 +1232,110 @@ def capped_score_weights(candidates):
     return weights
 
 
-def compute_recommendations(predicted, ledger):
-    eligible = [r for r in predicted if r.get("sentiment", 0) >= 0]
-    eligible_tickers = {r["ticker"] for r in eligible}
-    cash = ledger["cash_balance"]
-    recs = []
-
-    # Load full prediction data for sentiment lookup on all tickers
-    _all_pred = []
-    try:
-        import os
+def compute_recommendations(predicted, ledger, all_predictions=None):
+    """Build bounded recommendations from the top ranks and the complete scored universe."""
+    if all_predictions is None:
+        all_predictions = []
         if os.path.exists(COMPETITION_PREDICTION_FILE):
-            with open(COMPETITION_PREDICTION_FILE) as _f:
-                _all_pred = json.load(_f)
-    except Exception:
-        _all_pred = []
-    _sentiment_map = {p["ticker"]: p.get("sentiment", 0) for p in _all_pred}
-
-    # Track all tickers we've sold (full or partial)
+            loaded = _read_json(COMPETITION_PREDICTION_FILE)
+            if isinstance(loaded, list):
+                all_predictions = loaded
+    all_prediction_map = {r["ticker"]: r for r in all_predictions if isinstance(r, dict) and "ticker" in r}
+    ranked_tickers = {r["ticker"] for r in predicted}
+    eligible = [r for r in predicted if r.get("sentiment", 0) >= SENTIMENT_BUY_THRESHOLD]
+    cash = max(0.0, ledger["cash_balance"])
+    recs = []
     sold_tickers = set()
+    full_exit_tickers = set()
 
-    # Full stop-loss: SELL holdings down > STOP_LOSS_PERCENT from avg_price
-    for ticker in list(ledger["holdings"].keys()):
-        pos = ledger["holdings"][ticker]
+    def add_sell(ticker, shares, price, reason, full_exit=False):
+        recs.append({
+            "ticker": ticker,
+            "action": "SELL",
+            "target_shares": shares,
+            "price": price,
+            "reason": reason,
+        })
+        sold_tickers.add(ticker)
+        if full_exit:
+            full_exit_tickers.add(ticker)
+
+    # Full stop-loss has priority over every other exit rule.
+    for ticker, pos in ledger["holdings"].items():
         price = _get_price(ticker)
         if price and price > 0:
             loss_pct = (price - pos["avg_price"]) / pos["avg_price"]
-            if loss_pct < -STOP_LOSS_PERCENT:
-                recs.append({"ticker": ticker, "action": "SELL", "target_shares": pos["shares"], "price": price})
-                sold_tickers.add(ticker)
+            if loss_pct <= -STOP_LOSS_PERCENT:
+                add_sell(ticker, pos["shares"], price, "stop_loss", full_exit=True)
 
-    # Partial trim: SELL half of positions down > TRAILING_TRIM_PERCENT (but not at full stop-loss)
-    for ticker in list(ledger["holdings"].keys()):
-        if ticker in sold_tickers:
+    # Each partial exit is marked only after the matching sell is logged.
+    for ticker, pos in ledger["holdings"].items():
+        if ticker in sold_tickers or pos.get("trim_executed", False):
             continue
-        pos = ledger["holdings"][ticker]
         price = _get_price(ticker)
         if price and price > 0:
             loss_pct = (price - pos["avg_price"]) / pos["avg_price"]
-            if loss_pct < -TRAILING_TRIM_PERCENT:
-                half = max(1, pos["shares"] // 2)
-                recs.append({"ticker": ticker, "action": "SELL", "target_shares": half, "price": price})
-                sold_tickers.add(ticker)
+            if loss_pct <= -TRAILING_TRIM_PERCENT:
+                add_sell(ticker, max(1, pos["shares"] // 2), price, "trailing_trim")
 
-    # Profit-taking: SELL half of positions up > PROFIT_TAKE_PERCENT
-    for ticker in list(ledger["holdings"].keys()):
-        if ticker in sold_tickers:
+    for ticker, pos in ledger["holdings"].items():
+        if ticker in sold_tickers or pos.get("profit_taken", False):
             continue
-        pos = ledger["holdings"][ticker]
         price = _get_price(ticker)
         if price and price > 0:
             gain_pct = (price - pos["avg_price"]) / pos["avg_price"]
-            if gain_pct > PROFIT_TAKE_PERCENT:
-                half = max(1, pos["shares"] // 2)
-                recs.append({"ticker": ticker, "action": "SELL", "target_shares": half, "price": price})
-                sold_tickers.add(ticker)
+            if gain_pct >= PROFIT_TAKE_PERCENT:
+                add_sell(ticker, max(1, pos["shares"] // 2), price, "profit_take")
 
-    # SELL holdings with genuinely negative sentiment (not already sold)
-    for ticker in list(ledger["holdings"].keys()):
+    # A held name outside the current top 12, missing from the universe, or below the
+    # sentiment threshold receives a full exit rather than silently disappearing.
+    for ticker, pos in ledger["holdings"].items():
         if ticker in sold_tickers:
             continue
-        if _sentiment_map.get(ticker, 0) < 0:
+        scored = all_prediction_map.get(ticker)
+        if scored is None or ticker not in ranked_tickers or scored.get("sentiment", 0) < SENTIMENT_BUY_THRESHOLD:
             price = _get_price(ticker)
-            recs.append({"ticker": ticker, "action": "SELL", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
-            sold_tickers.add(ticker)
+            add_sell(ticker, pos["shares"], price, "rank_or_sentiment_exit", full_exit=True)
 
-    # Pick top 2 eligible non-sold tickers: 60/40 split
-    live_eligible = [r for r in eligible if r["ticker"] not in sold_tickers]
+    remaining_holdings = len(ledger["holdings"]) - len(full_exit_tickers)
+    slots = max(0, MAX_PORTFOLIO_HOLDINGS - remaining_holdings)
+    buy_candidates = [
+        r for r in eligible
+        if r["ticker"] not in ledger["holdings"] and r["ticker"] not in sold_tickers
+    ][:min(MAX_BUYS_PER_CYCLE, slots)]
     buy_tickers = []
-    if live_eligible:
-        splits = [(cash * 0.6, live_eligible[0]), (cash * 0.4, live_eligible[1])] if len(live_eligible) >= 2 else [(cash, live_eligible[0])]
-        for alloc, candidate in splits:
-            price = _get_price(candidate["ticker"])
-            if price and price > 0:
-                target_shares = int(alloc / price)
-                if target_shares > 0:
-                    recs.append({"ticker": candidate["ticker"], "action": "BUY", "target_shares": target_shares, "price": price})
-                    buy_tickers.append(candidate["ticker"])
+    buy_weights = capped_score_weights(buy_candidates)
+    for candidate in buy_candidates:
+        weight = buy_weights.get(candidate["ticker"], 0.0)
+        price = _get_price(candidate["ticker"])
+        if price and price > 0:
+            target_shares = int((cash * weight) / price)
+            if target_shares > 0:
+                recs.append({
+                    "ticker": candidate["ticker"],
+                    "action": "BUY",
+                    "target_shares": target_shares,
+                    "price": price,
+                    "reason": "ranked_buy",
+                })
+                buy_tickers.append(candidate["ticker"])
 
-    # HOLD for remaining held tickers (not sold, not negative sentiment, not in buy list)
-    for r in predicted:
-        ticker = r["ticker"]
-        if ticker not in ledger["holdings"]:
-            continue
+    for ticker, pos in ledger["holdings"].items():
         if ticker in sold_tickers:
             continue
-        if ticker not in eligible_tickers:
-            continue  # Already handled as SELL above
-        if ticker in buy_tickers:
-            continue  # Already being bought more
-        price = _get_price(ticker)
-        recs.append({"ticker": ticker, "action": "HOLD", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
+        recs.append({"ticker": ticker, "action": "HOLD", "target_shares": pos["shares"], "price": _get_price(ticker)})
 
-    # Display: buy tickers + all held tickers, in rank order
-    display_tickers = set(buy_tickers)
-    for t in ledger["holdings"]:
-        display_tickers.add(t)
-    display_list = [r for r in predicted if r["ticker"] in display_tickers]
-    return recs, display_list
+    return recs, predicted
 
 
 # ── viz update ───────────────────────────────────────────────────────────
 
 def visualization_update(record_chart=True):
+    with COMPETITION_LEDGER_LOCK:
+        return _visualization_update_unlocked(record_chart)
+
+
+def _visualization_update_unlocked(record_chart=True):
     ledger = load_competition_ledger()
     portfolio_value = ledger["cash_balance"] + _holdings_value(ledger)
     if record_chart:
@@ -1219,13 +1357,13 @@ def visualization_update(record_chart=True):
 
 # ── reset ────────────────────────────────────────────────────────────────
 
-def handle_reset():
+def _handle_reset_unlocked():
     state_files = [
-        GATE_FILE, NEWS_CACHE_FILE,
+        GATE_FILE, NEWS_CACHE_FILE, NEWS_CACHE_BACKUP,
         MESSAGE_STATE_FILE, NEWS_MESSAGE_STATE_FILE,
-        NEWS_CYCLE_FILE, NEWS_LOCK_FILE,
+        NEWS_CYCLE_FILE,
         COMPETITION_LEDGER, COMPETITION_MESSAGE_STATE, COMPETITION_PREDICTION_FILE,
-        FUNDAMENTALS_CACHE_FILE,
+        FUNDAMENTALS_CACHE_FILE, OBSERVATION_FILE, RUN_MODE_FILE, MARKETWATCH_SYNC_FILE,
     ]
     statuses = {}
     for path in state_files:
@@ -1253,35 +1391,25 @@ def handle_reset():
     if os.path.exists(COMPETITION_CHART):
         os.remove(COMPETITION_CHART)
         statuses[os.path.basename(COMPETITION_CHART)] = "deleted"
-    PIPELINE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PIPELINE.md")
-    if os.path.exists(PIPELINE_PATH):
-        with open(PIPELINE_PATH, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-        divider_indices = [i for i, line in enumerate(lines) if line.strip() == "---"]
-        if len(divider_indices) >= 2:
-            keep_start = divider_indices[0] + 1
-            keep_end = divider_indices[-1]
-            new_lines = lines[:keep_start] + lines[keep_end:]
-        else:
-            new_lines = lines
-        cleaned = [new_lines[0]]
-        for line in new_lines[1:]:
-            if line.strip() == "---" and cleaned[-1].strip() == "---":
-                continue
-            cleaned.append(line)
-        with open(PIPELINE_PATH, "w", encoding="utf-8") as f:
-            f.writelines(cleaned)
-        pipeline_status = "log entries cleared"
-    else:
-        pipeline_status = "not found"
     print(f"\n{'='*80}")
     print(f"  SYSTEM RESET")
     print(f"{'='*80}")
     for name, st in statuses.items():
         print(f"  {name:<25} {st}")
-    print(f"  PIPELINE.md{'':<15} {pipeline_status}")
+    print("  PIPELINE.md              preserved (audit history is never reset)")
     print(f"  System reset complete. Ready for new epoch.")
     print(f"{'='*80}")
+
+
+def handle_reset():
+    """Clear state only while no engine or worker owns the shared news cache."""
+    if not acquire_news_lock(attempts=300):
+        raise RuntimeError("Could not acquire the news lock for reset; a worker may still be active.")
+    try:
+        with COMPETITION_LEDGER_LOCK:
+            _handle_reset_unlocked()
+    finally:
+        release_news_lock()
 
 
 # ── news stream ──────────────────────────────────────────────────────────
@@ -1311,6 +1439,9 @@ def run_news_stream(news_cache, et_now, send_roundup=True):
             print(f"  [News] {ticker} ({i}/{total}) ERROR — {e}")
         if i < total:
             time.sleep(random.uniform(NEWS_RATE_MIN, NEWS_RATE_MAX))
+    pruned, window_hours = prune_news_cache(news_cache)
+    if pruned > 0:
+        print(f"  [Cache] Pruned {pruned} duplicate, excess, or expired headline(s) before save ({window_hours}h window).")
     save_news_cache(news_cache)
     if send_roundup:
         send_batched_news(news_alerts, et_now)
@@ -1324,13 +1455,15 @@ def run_news_worker(once=False, send_roundup=False):
     print(f"  GLASSBOX FINANCE — News Worker")
     print(f"  Mode: {'one-shot' if once else 'continuous'}  |  Watchlist: {WATCHLIST_SCANNER_LIMIT} tickers")
     print(f"{'='*80}")
-    news_cache = load_news_cache()
-    repair_news_cache(news_cache)
+    log_sentiment_backend()
     release_stale_news_lock()
     while True:
         _, et_now = check_market_clock()
         if acquire_news_lock():
             try:
+                # Reload after acquiring the shared lock so another worker cannot be overwritten.
+                news_cache = load_news_cache()
+                repair_news_cache(news_cache)
                 pruned, window_hours = prune_news_cache(news_cache)
                 if pruned > 0:
                     print(f"  [Cache] Pruned {pruned} headline(s) older than {window_hours}h window.")
@@ -1353,12 +1486,11 @@ class EngineRunner:
         self._paused.set()
         self._stopped = threading.Event()
         self._trigger = threading.Event()
+        self._busy = threading.Event()
+        self._reload_state = threading.Event()
+        self._cycle_guard = threading.Lock()
         self._thread = None
-        # Clear any stale news lock from previous run
-        for f in os.listdir(DATA_DIR):
-            if f.startswith(".news_lock"):
-                os.remove(os.path.join(DATA_DIR, f))
-                print(f"  [Engine] Cleaned stale lock: {f}")
+        release_stale_news_lock()
         self.status = {
             "mode": run_mode,
             "market_state": "ANALYTICAL_OFF_HOURS",
@@ -1383,6 +1515,20 @@ class EngineRunner:
         self._paused.clear()
         with self._lock:
             self.status["paused"] = True
+
+    def pause_and_wait(self, timeout_seconds=300):
+        """Stop at a cycle boundary before destructive state work begins."""
+        self.pause()
+        deadline = time.monotonic() + timeout_seconds
+        while time.monotonic() < deadline:
+            with self._cycle_guard:
+                if not self._busy.is_set() or not self._thread or not self._thread.is_alive():
+                    return True
+            time.sleep(0.1)
+        return False
+
+    def request_state_reload(self):
+        self._reload_state.set()
 
     def resume(self):
         self._paused.set()
@@ -1426,6 +1572,7 @@ class EngineRunner:
         print(f"  Mode: {self.run_mode}  |  Watchlist: {WATCHLIST_SCANNER_LIMIT} tickers  |  Max Holdings: {MAX_PORTFOLIO_HOLDINGS}")
         print(f"{'='*80}")
 
+        log_sentiment_backend()
         news_cache = load_news_cache()
         release_stale_news_lock()
         repair_news_cache(news_cache)
@@ -1436,6 +1583,16 @@ class EngineRunner:
 
         while not self._stopped.is_set():
             self._paused.wait()
+            if self._stopped.is_set():
+                break
+            with self._cycle_guard:
+                if not self._paused.is_set():
+                    continue
+                self._busy.set()
+            if self._reload_state.is_set():
+                news_cache = load_news_cache()
+                repair_news_cache(news_cache)
+                self._reload_state.clear()
 
             cycle_start = datetime.datetime.now(datetime.timezone.utc)
             now_ts = cycle_start.timestamp()
@@ -1465,6 +1622,12 @@ class EngineRunner:
             if check_news_cycle():
                 if acquire_news_lock():
                     try:
+                        # The lock protects both fetch and save; reload the latest shared cache first.
+                        news_cache = load_news_cache()
+                        repair_news_cache(news_cache)
+                        pruned, window_hours = prune_news_cache(news_cache)
+                        if pruned > 0:
+                            print(f"  [Cache] Pruned {pruned} headline(s) older than {window_hours}h window.")
                         run_news_stream(news_cache, et_now)
                         mark_news_cycle()
                         self._update_status(news_last_run=datetime.datetime.now(datetime.timezone.utc).isoformat())
@@ -1475,17 +1638,17 @@ class EngineRunner:
             # Re-run full evaluation after news cycle so predicted allocation reflects latest sentiment
             if news_just_fetched_this_cycle:
                 print(f"\n  [Eval] Running full ticker evaluation (sentiment updated)...")
-                predicted = run_full_evaluation(news_cache)
-                if predicted:
-                    with open(COMPETITION_PREDICTION_FILE, "w") as f:
-                        json.dump(predicted, f, indent=2)
+                ranked_predictions = run_full_evaluation(news_cache)
+                predicted = ranked_predictions[:MAX_PORTFOLIO_HOLDINGS]
+                if ranked_predictions:
+                    _write_json_atomic(COMPETITION_PREDICTION_FILE, ranked_predictions)
                 news_just_fetched_this_cycle = False
 
                 # Compare predicted vs real ledger
                 ledger = load_competition_ledger()
-                recs, display = compute_recommendations(predicted, ledger)
+                recs, display = compute_recommendations(predicted, ledger, ranked_predictions)
                 daily_allowed = check_daily_gate()
-                has_final_recs = daily_allowed
+                has_final_recs = daily_allowed and market_state == "MARKET_OPEN" and marketwatch_sync_status()["healthy"]
 
                 payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=has_final_recs)
 
@@ -1511,14 +1674,19 @@ class EngineRunner:
                 self._update_status(holdings_count=len(ledger["holdings"]), portfolio_value=ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL)
 
                 # Rebuild dashboard with latest ledger data + stored prediction
-                predicted = []
+                ranked_predictions = []
                 if os.path.exists(COMPETITION_PREDICTION_FILE):
-                    with open(COMPETITION_PREDICTION_FILE, "r") as f:
-                        predicted = json.load(f)
-                recs, display = compute_recommendations(predicted, ledger) if predicted else ([], [])
+                    loaded = _read_json(COMPETITION_PREDICTION_FILE)
+                    if isinstance(loaded, list):
+                        ranked_predictions = loaded
+                predicted = ranked_predictions[:MAX_PORTFOLIO_HOLDINGS]
+                recs, display = compute_recommendations(predicted, ledger, ranked_predictions) if predicted else ([], [])
                 daily_allowed = check_daily_gate()
-                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=True)
+                has_final_recs = daily_allowed and market_state == "MARKET_OPEN" and marketwatch_sync_status()["healthy"]
+                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=has_final_recs)
                 send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
 
             self._sleep_with_trigger(5)
             self.clear_trigger()
+            with self._cycle_guard:
+                self._busy.clear()

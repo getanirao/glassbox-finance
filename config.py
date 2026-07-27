@@ -29,6 +29,11 @@ NEWS_CYCLE_HOURS = 1
 NEWS_RATE_MIN = 1.5
 NEWS_RATE_MAX = 3.5
 NEWS_LOCK_STALE_MINUTES = 90
+MAX_HEADLINES_PER_TICKER = 30
+
+ENABLE_ARTICLE_SUMMARIZATION = os.getenv("ENABLE_ARTICLE_SUMMARIZATION", "false").lower() in {"1", "true", "yes"}
+SUMMARIZE_PROVIDER = os.getenv("SUMMARIZE_PROVIDER", "openai").lower()
+SUMMARIZE_MAX_CHARS = 4000
 
 GATE_FILE = os.path.join(DATA_DIR, ".last_run")
 NEWS_CACHE_FILE = os.path.join(DATA_DIR, ".news_cache.json")
@@ -50,6 +55,15 @@ COMPETITION_PREDICTION_FILE = os.path.join(DATA_DIR, ".competition_prediction.js
 FUNDAMENTALS_CACHE_FILE = os.path.join(DATA_DIR, ".fundamentals_cache.json")
 FUNDAMENTALS_CACHE_TTL_HOURS = 24
 EXECUTION_WINDOW_MINUTES = 15
+
+# Opt-in bridge; execution recommendations fail closed until a verified snapshot arrives.
+MARKETWATCH_SYNC_ENABLED = os.getenv("MARKETWATCH_SYNC_ENABLED", "false").lower() in {"1", "true", "yes"}
+MARKETWATCH_SYNC_HOST = os.getenv("MARKETWATCH_SYNC_HOST", "0.0.0.0")
+MARKETWATCH_SYNC_PORT = int(os.getenv("MARKETWATCH_SYNC_PORT", "8765"))
+MARKETWATCH_SYNC_TOKEN = os.getenv("MARKETWATCH_SYNC_TOKEN", "")
+MARKETWATCH_SYNC_FILE = os.path.join(DATA_DIR, "marketwatch_sync_state.json")
+MARKETWATCH_GAME_SLUG = os.getenv("MARKETWATCH_GAME_SLUG", "wolves-of-wall-street---july-2026")
+MARKETWATCH_SYNC_MAX_STALENESS_SECONDS = int(os.getenv("MARKETWATCH_SYNC_MAX_STALENESS_SECONDS", "300"))
 
 NYSE_FULL_DAY_CLOSURES_2026 = {
     "2026-01-01",

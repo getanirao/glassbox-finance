@@ -32,7 +32,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --from=model-builder /app/models /app/models
-COPY config.py lexicon.py sentiment.py engine.py bot.py main.py ./
+COPY config.py lexicon.py sentiment.py summarizer.py engine.py marketwatch_sync.py bot.py main.py ./
 
 RUN mkdir -p /app/data
 

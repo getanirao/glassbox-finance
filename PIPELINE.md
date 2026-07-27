@@ -1,3 +1,10 @@
+### 2026-07-27 20:46 (UTC)
+- **Change:** Allowed MarketWatch baseline establishment when the ledger has only cash-only visualization points, while preserving the hard block for any prior recorded trade.
+- **Reason:** A clean competition can accumulate chart refresh history before its first trade; treating that telemetry as execution state would require an unnecessary destructive reset.
+- **Files:** `marketwatch_sync.py`, `README.md`, `history/LOG_ARCHIVE_V5.md`, `PIPELINE.md`
+
+---
+
 ### 2026-07-27 20:39 (UTC)
 - **Change:** Added a passive MarketWatch-to-Glassbox bridge, including an authenticated fail-closed receiver, durable browser outbox, timestamp-preserving activity replay, reconciliation state, dashboard gating, and loopback-only Docker exposure.
 - **Reason:** The Wolves workflow needs MarketWatch to remain the sole execution surface while Glassbox receives durable, original-time trade context without Discord commands or speculative position inference.
@@ -137,21 +144,4 @@
 
 ---
 
-### Entry 29 — 2026-07-12T20:00:00Z
-
-**Action:** Applied temperature scaling (T=0.5) to FinBERT ONNX logits to sharpen compressed sentiment scores.
-
-**Changes:**
-- Added `FINBERT_TEMPERATURE = 0.5` to `config.py`
-- In `_score_onnx()`, logits are divided by T before softmax: `logits = logits / 0.5`
-- T < 1 redistributes neutral probability mass to the winning class, correcting FinBERT's conservative bias on mildly-toned financial headlines
-- Example effect: "Should You Buy Microsoft Stock?" → net +0.28→+0.50; "Here's Why Salesforce is One of the Best" → +0.34→+0.62
-- Existing cache headlines re-scored via `repair_news_cache()` on next startup
-
-**Research Basis:** Temperature scaling (Guo et al. 2017, 3,000+ citations) is the standard post-hoc calibration method. T=0.5 chosen as inverse temperature (sharpening) to compensate for FinBERT's 3-class output where neutral probability compresses the pos-neg spread. No calibration set required — T=0.5 provides approximately 2× slope near zero.
-
-**Files Touched:** `config.py`, `sentiment.py`, `PIPELINE.md`, `README.md`
-
----
-
-_Older logs archived in /history/LOG_ARCHIVE_V4.md_
+_Older logs archived in /history/LOG_ARCHIVE_V5.md_

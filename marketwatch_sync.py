@@ -142,10 +142,12 @@ def _normalized_snapshot(snapshot):
 
 
 def _ledger_is_fresh(ledger):
+    history = ledger.get("history", [])
     return (
         not ledger.get("holdings")
-        and not ledger.get("history")
         and abs(float(ledger.get("cash_balance", STARTING_CAPITAL)) - STARTING_CAPITAL) < 0.01
+        # Visualization points do not represent executed trades and are safe to retain.
+        and not any(isinstance(entry, dict) and entry.get("event") for entry in history)
     )
 
 

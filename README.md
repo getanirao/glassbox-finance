@@ -74,7 +74,7 @@ The bridge is intentionally disabled by default. It needs a dedicated public **H
 4. In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the `marketwatch-bridge` folder in this repository.
 5. Open the extension options, enter the public HTTPS origin and bridge token, then visit the signed-in Wolves **Portfolio** page. Wait for the page badge and Discord dashboard to say `healthy` before relying on final trade instructions.
 
-The baseline step reads the current portfolio only; it creates no MarketWatch transaction. A blocked or stale bridge converts the Discord dashboard to preview-only until the mismatch is resolved.
+The baseline step reads the current portfolio only; it creates no MarketWatch transaction. Existing cash-only chart points do not block a baseline, but any prior recorded trade does. A blocked or stale bridge converts the Discord dashboard to preview-only until the mismatch is resolved.
 
 ### Config Constants (`config.py`)
 | Constant | Value | Purpose |

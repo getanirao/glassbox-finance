@@ -14,6 +14,10 @@
     "service_worker": "service-worker.js",
     "type": "module"
   },
+  "action": {
+    "default_title": "Glassbox MarketWatch Bridge",
+    "default_popup": "popup.html"
+  },
   "content_scripts": [
     {
       "matches": ["https://www.marketwatch.com/games/*"],

@@ -43,6 +43,10 @@ function readPortfolio() {
     }
     return { positions_complete: true, positions };
   }
+  const pageText = clean(document.body?.innerText).toLowerCase();
+  if (pageText.includes("your portfolio") && pageText.includes("you currently have no holdings")) {
+    return { positions_complete: true, positions: [] };
+  }
   return { positions_complete: false, positions: [] };
 }
 

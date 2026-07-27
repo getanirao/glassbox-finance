@@ -1,3 +1,10 @@
+### 2026-07-27 21:17 (UTC)
+- **Change:** Added a clickable extension status popup and recognized the visible no-holdings state as a complete empty Portfolio snapshot.
+- **Reason:** The initial MarketWatch Portfolio page has no HTML holdings table when cash-only; the bridge must establish its baseline without a test trade while providing an obvious route to settings.
+- **Files:** `marketwatch-bridge/manifest.json`, `marketwatch-bridge/content.js`, `marketwatch-bridge/popup.html`, `marketwatch-bridge/popup.js`, `README.md`, `history/LOG_ARCHIVE_V7.md`, `PIPELINE.md`
+
+---
+
 ### 2026-07-27 21:08 (UTC)
 - **Change:** Reconfigured the MarketWatch bridge for local-only operation through a token-protected `127.0.0.1` Docker receiver and allowed loopback HTTP exclusively in the extension.
 - **Reason:** This deployment runs on the user's PC, not an Oracle host; local routing avoids accounts, domains, public ports, and unnecessary network exposure.
@@ -120,19 +127,4 @@
 
 ---
 
-### Entry 31 — 2026-07-12T22:00:00Z
-
-**Action:** Removed SKIP rows from dashboard; capped BUY recommendations to top 6 to prevent capital dilution.
-
-**Changes:**
-- **SKIP eliminated**: Negative-sentiment tickers are now filtered out of `predicted` entirely in `compute_recommendations()`. Only sentiment ≥ 0.0 tickers appear in the dashboard allocation table.
-- **MAX_BUYS_PER_CYCLE = 6**: Only the top 6 eligible tickers (by adjusted_score) receive BUY recommendations. Held tickers past position 6 get HOLD. Tickers that dropped out or turned negative get SELL.
-- **Return type changed**: `compute_recommendations()` now returns `(recs, display_list)` where `display_list` is the sentiment-filtered predicted list, which is passed to the dashboard instead of the raw top-12.
-
-**Logic:** Previously 12 BUY rows diluted capital to ~$8,333 each. Now the top 6 split available cash score-weightedly. Example: with $100k cash and scores [120, 120, 120, 120, 97, 92], allocations are ~$19.6k, $19.6k, $19.6k, $19.6k, $15.9k, $15.1k — concentrated in the strongest signals. Negative sentiment tickers like GOOGL (-0.184), JNJ (-0.322), AMZN (-0.215) no longer appear at all.
-
-**Files Touched:** `config.py`, `engine.py`, `PIPELINE.md`, `README.md`
-
----
-
-_Older logs archived in /history/LOG_ARCHIVE_V6.md_
+_Older logs archived in /history/LOG_ARCHIVE_V7.md_

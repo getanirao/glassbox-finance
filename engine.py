@@ -1112,8 +1112,10 @@ def compute_recommendations(predicted, ledger):
         _all_pred = []
     _sentiment_map = {p["ticker"]: p.get("sentiment", 0) for p in _all_pred}
 
-    # Stop-loss: SELL holdings down > STOP_LOSS_PERCENT from avg_price
-    stop_loss_tickers = set()
+    # Track all tickers we've sold (full or partial)
+    sold_tickers = set()
+
+    # Full stop-loss: SELL holdings down > STOP_LOSS_PERCENT from avg_price
     for ticker in list(ledger["holdings"].keys()):
         pos = ledger["holdings"][ticker]
         price = _get_price(ticker)
@@ -1121,18 +1123,45 @@ def compute_recommendations(predicted, ledger):
             loss_pct = (price - pos["avg_price"]) / pos["avg_price"]
             if loss_pct < -STOP_LOSS_PERCENT:
                 recs.append({"ticker": ticker, "action": "SELL", "target_shares": pos["shares"], "price": price})
-                stop_loss_tickers.add(ticker)
+                sold_tickers.add(ticker)
 
-    # SELL holdings with genuinely negative sentiment (not already stop-loss)
+    # Partial trim: SELL half of positions down > TRAILING_TRIM_PERCENT (but not at full stop-loss)
     for ticker in list(ledger["holdings"].keys()):
-        if ticker in stop_loss_tickers:
+        if ticker in sold_tickers:
+            continue
+        pos = ledger["holdings"][ticker]
+        price = _get_price(ticker)
+        if price and price > 0:
+            loss_pct = (price - pos["avg_price"]) / pos["avg_price"]
+            if loss_pct < -TRAILING_TRIM_PERCENT:
+                half = max(1, pos["shares"] // 2)
+                recs.append({"ticker": ticker, "action": "SELL", "target_shares": half, "price": price})
+                sold_tickers.add(ticker)
+
+    # Profit-taking: SELL half of positions up > PROFIT_TAKE_PERCENT
+    for ticker in list(ledger["holdings"].keys()):
+        if ticker in sold_tickers:
+            continue
+        pos = ledger["holdings"][ticker]
+        price = _get_price(ticker)
+        if price and price > 0:
+            gain_pct = (price - pos["avg_price"]) / pos["avg_price"]
+            if gain_pct > PROFIT_TAKE_PERCENT:
+                half = max(1, pos["shares"] // 2)
+                recs.append({"ticker": ticker, "action": "SELL", "target_shares": half, "price": price})
+                sold_tickers.add(ticker)
+
+    # SELL holdings with genuinely negative sentiment (not already sold)
+    for ticker in list(ledger["holdings"].keys()):
+        if ticker in sold_tickers:
             continue
         if _sentiment_map.get(ticker, 0) < 0:
             price = _get_price(ticker)
             recs.append({"ticker": ticker, "action": "SELL", "target_shares": ledger["holdings"][ticker]["shares"], "price": price})
+            sold_tickers.add(ticker)
 
-    # Pick top 2 eligible non-stop-loss tickers: 60/40 split
-    live_eligible = [r for r in eligible if r["ticker"] not in stop_loss_tickers]
+    # Pick top 2 eligible non-sold tickers: 60/40 split
+    live_eligible = [r for r in eligible if r["ticker"] not in sold_tickers]
     buy_tickers = []
     if live_eligible:
         splits = [(cash * 0.6, live_eligible[0]), (cash * 0.4, live_eligible[1])] if len(live_eligible) >= 2 else [(cash, live_eligible[0])]
@@ -1144,12 +1173,12 @@ def compute_recommendations(predicted, ledger):
                     recs.append({"ticker": candidate["ticker"], "action": "BUY", "target_shares": target_shares, "price": price})
                     buy_tickers.append(candidate["ticker"])
 
-    # HOLD for remaining held tickers (not stop-loss, not negative sentiment, not in buy list)
+    # HOLD for remaining held tickers (not sold, not negative sentiment, not in buy list)
     for r in predicted:
         ticker = r["ticker"]
         if ticker not in ledger["holdings"]:
             continue
-        if ticker in stop_loss_tickers:
+        if ticker in sold_tickers:
             continue
         if ticker not in eligible_tickers:
             continue  # Already handled as SELL above

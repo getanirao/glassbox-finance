@@ -17,9 +17,9 @@
   </head>
   <body>
     <h1>Glassbox Bridge</h1>
-    <p class="note">This extension only reads the visible Wolves Portfolio and activity tables. It never clicks, submits, or changes a MarketWatch order.</p>
-    <label for="endpoint">Public HTTPS endpoint</label>
-    <input id="endpoint" type="url" placeholder="https://bridge.example.com" autocomplete="off">
+    <p class="note">This extension only reads the visible Wolves Portfolio and activity tables. It never clicks, submits, or changes a MarketWatch order. Use the local endpoint unless Glassbox is intentionally hosted elsewhere.</p>
+    <label for="endpoint">Bridge endpoint</label>
+    <input id="endpoint" type="url" placeholder="http://127.0.0.1:8765" autocomplete="off">
     <label for="token">Bridge token</label>
     <input id="token" type="password" minlength="32" autocomplete="new-password">
     <button id="save" type="button">Save secure bridge settings</button>

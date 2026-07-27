@@ -1,5 +1,6 @@
 # Environment variables (API keys, secrets)
 .env
+.marketwatch-bridge.env
 
 # Runtime state files
 .last_run

@@ -12,11 +12,13 @@ document.getElementById("save").addEventListener("click", async () => {
   try {
     endpoint = new URL(endpointInput.value.trim());
   } catch {
-    status.textContent = "Enter a valid HTTPS endpoint.";
+    status.textContent = "Enter a valid bridge endpoint.";
     return;
   }
-  if (endpoint.protocol !== "https:" || endpoint.username || endpoint.password || !endpoint.hostname) {
-    status.textContent = "The bridge endpoint must be a plain HTTPS URL.";
+  const isLoopback = endpoint.hostname === "127.0.0.1" || endpoint.hostname === "localhost";
+  const validProtocol = endpoint.protocol === "https:" || (endpoint.protocol === "http:" && isLoopback);
+  if (!validProtocol || endpoint.username || endpoint.password || !endpoint.hostname) {
+    status.textContent = "Use HTTPS, or HTTP only for localhost / 127.0.0.1.";
     return;
   }
   const token = tokenInput.value.trim();
@@ -24,11 +26,13 @@ document.getElementById("save").addEventListener("click", async () => {
     status.textContent = "Use a bridge token of at least 32 characters.";
     return;
   }
-  const origin = `${endpoint.protocol}//${endpoint.host}/*`;
-  const granted = await chrome.permissions.request({ origins: [origin] });
-  if (!granted) {
-    status.textContent = "The HTTPS host permission is required to sync.";
-    return;
+  if (!isLoopback) {
+    const origin = `${endpoint.protocol}//${endpoint.host}/*`;
+    const granted = await chrome.permissions.request({ origins: [origin] });
+    if (!granted) {
+      status.textContent = "The HTTPS host permission is required to sync.";
+      return;
+    }
   }
   await chrome.storage.local.set({ bridgeConfig: { endpoint: endpoint.origin, token } });
   tokenInput.value = "";

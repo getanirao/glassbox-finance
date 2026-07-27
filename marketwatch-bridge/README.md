@@ -4,10 +4,10 @@ This unpacked Chrome extension passively reads the visible Portfolio and activit
 
 ## Install
 
-1. Complete the HTTPS receiver setup in the repository `README.md`.
+1. Start the local receiver in the repository `README.md`.
 2. Open `chrome://extensions`, turn on Developer mode, and choose **Load unpacked**.
 3. Select this `marketwatch-bridge` folder.
-4. Open the extension details, choose **Extension options**, then enter the Glassbox HTTPS origin and bridge token.
+4. Open the extension details, choose **Extension options**, then enter `http://127.0.0.1:8765` and the bridge token.
 5. Visit the signed-in Wolves **Portfolio** view and wait for the in-page badge to report `healthy`.
 
 The service worker keeps unacknowledged snapshots in IndexedDB and retries them. A receiver rejection is shown as `blocked`; Glassbox also stops publishing final trade instructions until the reconciliation is healthy.

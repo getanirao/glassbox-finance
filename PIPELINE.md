@@ -1,3 +1,10 @@
+### 2026-07-27 21:08 (UTC)
+- **Change:** Reconfigured the MarketWatch bridge for local-only operation through a token-protected `127.0.0.1` Docker receiver and allowed loopback HTTP exclusively in the extension.
+- **Reason:** This deployment runs on the user's PC, not an Oracle host; local routing avoids accounts, domains, public ports, and unnecessary network exposure.
+- **Files:** `docker-compose.yml`, `.gitignore`, `.env.example`, `marketwatch-bridge.env.example`, `marketwatch-bridge/manifest.json`, `marketwatch-bridge/options.html`, `marketwatch-bridge/options.js`, `marketwatch-bridge/README.md`, `README.md`, `history/LOG_ARCHIVE_V6.md`, `PIPELINE.md`
+
+---
+
 ### 2026-07-27 20:46 (UTC)
 - **Change:** Allowed MarketWatch baseline establishment when the ledger has only cash-only visualization points, while preserving the hard block for any prior recorded trade.
 - **Reason:** A clean competition can accumulate chart refresh history before its first trade; treating that telemetry as execution state would require an unnecessary destructive reset.
@@ -128,20 +135,4 @@
 
 ---
 
-### Entry 30 — 2026-07-12T21:00:00Z
-
-**Action:** Added sentiment gate on BUY decisions and score-weighted allocation from available cash.
-
-**Changes:**
-- **Sentiment gate**: `compute_recommendations()` now checks `sentiment >= SENTIMENT_BUY_THRESHOLD` (default 0.0) before issuing a BUY. Tickers in the top 12 with negative sentiment show as **SKIP** (0 target shares) instead of BUY.
-- **Score-weighted allocation**: Instead of equal split of STARTING_CAPITAL, new BUY candidates split `cash_balance` proportionally by `adjusted_score`. Higher-scored tickers get more capital.
-- **Dashboard alignment**: Allocation section now uses a `rec_map` dict lookup so SKIP and BUY rows render in correct predicted-score order regardless of recommendation generation order.
-- Added `SENTIMENT_BUY_THRESHOLD = 0.0` to `config.py`.
-
-**Logic:** Previously a ticker with negative sentiment like JNJ (-0.322) would still get a BUY if it ranked in the top 12 by adjusted_score. Now BUY requires positive (or neutral) sentiment. Allocation is score-weighted so GOOGL (113.4) gets more cash than HAL (86.6), not equal splits.
-
-**Files Touched:** `config.py`, `engine.py`, `PIPELINE.md`, `README.md`
-
----
-
-_Older logs archived in /history/LOG_ARCHIVE_V5.md_
+_Older logs archived in /history/LOG_ARCHIVE_V6.md_

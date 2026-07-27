@@ -13,7 +13,7 @@ Quantitative finance engine providing real-time sentiment-driven BUY/HOLD/SELL r
 - **Safe Competition Reset Available** — `python main.py --clear` waits for the engine and shared news lock, removes both news-cache files plus all competition state, purges stored Discord dashboard messages, and preserves `PIPELINE.md` audit history.
 - **Bounded BUY/HOLD/SELL Recommendations Active** — The top 12 are screened at the configured sentiment threshold. Up to six new names receive score-weighted allocations capped at 30% each; existing holdings do not receive duplicate BUYs. A holding exits when it drops out of the top 12 or turns negative. Stop-loss, trim, and profit-taking exits are each explicitly tracked so a logged partial exit cannot repeat every cycle.
 - **Validated Trade Logging via `/trade`** — After executing on MarketWatch VSE, user logs the actual fill, for example `/trade ticker:CSCO action:buy shares:100 price:52.40`. The ledger rejects unsupported tickers, insufficient cash, oversells, and positions beyond the holding limit before updating cash, shares, and chart history.
-- **Passive MarketWatch Portfolio Bridge Ready** — The unpacked Manifest V3 extension observes only the visible Wolves Portfolio/activity tables, keeps an IndexedDB retry outbox, and replays acknowledged MarketWatch fills with their original timestamps. It never submits a MarketWatch order. The model fails closed when the visible cash or shares cannot be reconciled with the imported ledger.
+- **Local-Only MarketWatch Portfolio Bridge Active** — The unpacked Manifest V3 extension connects directly to the loopback Docker receiver, observes only the visible Wolves Portfolio/activity tables, keeps an IndexedDB retry outbox, and replays acknowledged MarketWatch fills with their original timestamps. It never submits a MarketWatch order. The model fails closed when the visible cash or shares cannot be reconciled with the imported ledger.
 - **NYSE Market Clock Gate Active** — Detects US Eastern Time and applies the 2026 NYSE full-day holiday and 1:00 PM ET early-close calendar. Final execution recommendations restricted to regular market hours. Predicted allocation updates continuously during off-hours as sentiment evolves.
 - **Continuous 60-Minute News Stream Active** — Scrapes headlines for all 75 tickers every 60 minutes, 24/7/365. A shared atomic lock plus reload-before-save coordination prevents engine/worker cache clobbering. Each cycle compiles one batched **News Roundup** Discord message, hard-capped at 2000 characters.
 - **Bounded Rolling News Cache Active** — Persistent `.news_cache.json` uses normalized title deduplication, publisher timestamps when available, and a 30-headline per-ticker cap within the adaptive time window.
@@ -66,13 +66,12 @@ See `ORACLE_ALWAYS_FREE_SETUP.md` for the full OCI Ampere A1 bootstrap and `POST
 
 ### MarketWatch Bridge
 
-The bridge is intentionally disabled by default. It needs a dedicated public **HTTPS** hostname that reverse-proxies only to the loopback-bound Docker port; do not expose port `8765` directly to the internet.
+The bridge is intentionally disabled by default. For this local Docker deployment, use the loopback endpoint `http://127.0.0.1:8765`; traffic never leaves this PC. A remote deployment instead needs a dedicated public **HTTPS** hostname that reverse-proxies only to the loopback-bound Docker port; do not expose port `8765` directly to the internet.
 
-1. Set `MARKETWATCH_SYNC_ENABLED=true` and a unique `MARKETWATCH_SYNC_TOKEN` of at least 32 characters in the Oracle `.env` file.
-2. Configure Caddy, Nginx, or a managed HTTPS tunnel to proxy `https://your-host/v1/marketwatch/*` to `http://127.0.0.1:8765` on the server.
-3. Run `docker compose up -d --build`, then visit `https://your-host/v1/marketwatch/health` to confirm the receiver is reachable.
-4. In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the `marketwatch-bridge` folder in this repository.
-5. Open the extension options, enter the public HTTPS origin and bridge token, then visit the signed-in Wolves **Portfolio** page. Wait for the page badge and Discord dashboard to say `healthy` before relying on final trade instructions.
+1. Create `.marketwatch-bridge.env` from `marketwatch-bridge.env.example`, set `MARKETWATCH_SYNC_ENABLED=true`, and use a unique `MARKETWATCH_SYNC_TOKEN` of at least 32 characters.
+2. Run `docker compose up -d --build`, then visit `http://127.0.0.1:8765/v1/marketwatch/health` to confirm the local receiver is reachable.
+3. In Chrome, open `chrome://extensions`, enable Developer mode, choose **Load unpacked**, and select the `marketwatch-bridge` folder in this repository.
+4. Open the extension options, enter `http://127.0.0.1:8765` and the bridge token, then visit the signed-in Wolves **Portfolio** page. Wait for the page badge and Discord dashboard to say `healthy` before relying on final trade instructions.
 
 The baseline step reads the current portfolio only; it creates no MarketWatch transaction. Existing cash-only chart points do not block a baseline, but any prior recorded trade does. A blocked or stale bridge converts the Discord dashboard to preview-only until the mismatch is resolved.
 

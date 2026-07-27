@@ -4,7 +4,11 @@
   "description": "Passively reconciles the Wolves of Wall Street portfolio with Glassbox Finance.",
   "version": "1.0.0",
   "permissions": ["alarms", "storage"],
-  "host_permissions": ["https://www.marketwatch.com/*"],
+  "host_permissions": [
+    "https://www.marketwatch.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
   "optional_host_permissions": ["https://*/*"],
   "background": {
     "service_worker": "service-worker.js",

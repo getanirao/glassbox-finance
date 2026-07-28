@@ -3,7 +3,12 @@ import os
 import re
 import json
 import numpy as np
-from config import BUSINESS_RISK_SENTIMENT_FLOOR, FINBERT_TEMPERATURE, MODEL_DIR
+from config import (
+    BUSINESS_RISK_SENTIMENT_FLOOR,
+    FINBERT_INTRA_OP_THREADS,
+    FINBERT_TEMPERATURE,
+    MODEL_DIR,
+)
 
 _NEGATION_WORDS = {"not", "no", "never", "neither", "nor", "t"}
 _BUSINESS_RISK_PATTERNS = [
@@ -36,8 +41,12 @@ class FinBERTScorer:
         try:
             import onnxruntime
             from transformers import AutoTokenizer
+            session_options = onnxruntime.SessionOptions()
+            session_options.intra_op_num_threads = FINBERT_INTRA_OP_THREADS
+            session_options.inter_op_num_threads = 1
+            session_options.execution_mode = onnxruntime.ExecutionMode.ORT_SEQUENTIAL
             self._session = onnxruntime.InferenceSession(
-                qp, providers=["CPUExecutionProvider"]
+                qp, sess_options=session_options, providers=["CPUExecutionProvider"]
             )
             self._tokenizer = AutoTokenizer.from_pretrained(self.model_dir)
             cfgp = os.path.join(self.model_dir, "config.json")
@@ -46,9 +55,9 @@ class FinBERTScorer:
                     cfg = json.load(f)
                 id2label = cfg.get("id2label", {})
                 for k, v in id2label.items():
-                    if v.lower() == "positive":
+                    if v.lower() in {"positive", "bullish"}:
                         self._pos_idx = int(k)
-                    elif v.lower() == "negative":
+                    elif v.lower() in {"negative", "bearish"}:
                         self._neg_idx = int(k)
         except Exception as exc:
             print(f"[sentiment] ONNX load failed: {exc}")

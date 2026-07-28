@@ -31,6 +31,7 @@ def main():
 
     print("Saving tokenizer...")
     tokenizer.save_pretrained(OUTPUT_DIR)
+    model.config.save_pretrained(OUTPUT_DIR)
 
     print("Exporting to ONNX...")
     dummy_input = tokenizer("Test headline", return_tensors="pt")

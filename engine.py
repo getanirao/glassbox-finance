@@ -9,22 +9,24 @@ import threading
 import shutil
 import tempfile
 import zoneinfo
+import traceback
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 import requests
 import logging
 _yf_logger = logging.getLogger('yfinance')
 _yf_logger.disabled = True
 import yfinance as yf
 import pandas as pd
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 
 from config import *
 
 from sentiment import score_headline, get_scorer
 
 NEWS_LOCK_OWNER = f"{os.getpid()}:{datetime.datetime.now(datetime.timezone.utc).isoformat()}"
+NEWS_LOCK_FD = None
 COMPETITION_LEDGER_LOCK = threading.RLock()
 
 
@@ -90,7 +92,7 @@ def load_news_cache():
         if _valid_news_cache(backup):
             return backup
     # A missing main cache is an intentional fresh start. Do not resurrect a backup.
-    return {"headlines": []}
+    return {"headlines": [], "scoring_version": None}
 
 
 def save_news_cache(cache):
@@ -103,6 +105,12 @@ def save_news_cache(cache):
 
 
 def repair_news_cache(cache):
+    scorer = get_scorer()
+    scorer.score("market update")
+    backend = "lm" if scorer.using_lm else "onnx"
+    scoring_version = f"{SENTIMENT_SCORING_VERSION}:{backend}"
+    if cache.get("scoring_version") == scoring_version:
+        return 0
     fixed = 0
     for h in cache["headlines"]:
         text = h.get("scored_text") or h.get("text", "")
@@ -114,8 +122,17 @@ def repair_news_cache(cache):
             h["neg_count"] = round(neg, 4)
             h["critical_neg"] = 0
             fixed += 1
+    cache["scoring_version"] = scoring_version
     if fixed:
         print(f"  [Cache] Repaired {fixed} headline(s) with FinBERT scores.")
+    return fixed
+
+
+def repair_and_persist_news_cache(cache):
+    previous_version = cache.get("scoring_version")
+    fixed = repair_news_cache(cache)
+    if cache.get("scoring_version") != previous_version:
+        save_news_cache(cache)
     return fixed
 
 
@@ -128,28 +145,40 @@ def get_cache_window_hours():
 
 def prune_news_cache(cache):
     window_hours = get_cache_window_hours()
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=window_hours)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    short_cutoff = now - datetime.timedelta(hours=window_hours)
+    long_cutoff = now - datetime.timedelta(hours=LONG_WINDOW_HOURS)
     before = len(cache["headlines"])
     surviving = []
     for h in cache["headlines"]:
         ts = _entry_timestamp(h)
         if ts is None:
             continue
-        if ts >= cutoff:
+        if ts >= long_cutoff:
             surviving.append(h)
     deduped = []
     seen = set()
-    per_ticker = {}
+    short_counts = {}
+    historical_day_counts = {}
     for h in sorted(surviving, key=lambda item: _entry_timestamp(item), reverse=True):
         ticker = str(h.get("ticker", "")).upper()
         text = h.get("text", "")
         if not ticker or not text:
             continue
         key = _headline_key(ticker, text)
-        if key in seen or per_ticker.get(ticker, 0) >= MAX_HEADLINES_PER_TICKER:
+        if key in seen:
             continue
+        timestamp = _entry_timestamp(h)
+        if timestamp >= short_cutoff:
+            if short_counts.get(ticker, 0) >= MAX_HEADLINES_PER_TICKER:
+                continue
+            short_counts[ticker] = short_counts.get(ticker, 0) + 1
+        else:
+            day_key = (ticker, timestamp.date().isoformat())
+            if historical_day_counts.get(day_key, 0) >= MAX_LONG_HEADLINES_PER_TICKER_DAY:
+                continue
+            historical_day_counts[day_key] = historical_day_counts.get(day_key, 0) + 1
         seen.add(key)
-        per_ticker[ticker] = per_ticker.get(ticker, 0) + 1
         deduped.append(h)
     cache["headlines"] = list(reversed(deduped))
     return before - len(cache["headlines"]), window_hours
@@ -170,8 +199,8 @@ def compute_rolling_sentiment(entries, ticker, window_hours=None):
     name = TICKER_NAMES.get(ticker, "").lower()
     total_weight = 0.0
     weighted_net = 0.0
-    weighted_pos = 0.0
-    weighted_neg = 0.0
+    positive_headlines = 0
+    negative_headlines = 0
     for h in ticker_entries:
         age = now - _entry_timestamp(h)
         age_hours = age.total_seconds() / 3600
@@ -193,10 +222,27 @@ def compute_rolling_sentiment(entries, ticker, window_hours=None):
             weight *= (1 + critical)
         total_weight += weight
         weighted_net += net_score * weight
-        weighted_pos += h["pos_count"] * weight
-        weighted_neg += h["neg_count"] * weight
+        if net_score > 0.05:
+            positive_headlines += 1
+        elif net_score < -0.05:
+            negative_headlines += 1
     avg_net = weighted_net / total_weight if total_weight > 0 else 0.0
-    return avg_net, round(weighted_pos), round(weighted_neg), len(ticker_entries)
+    return avg_net, positive_headlines, negative_headlines, len(ticker_entries)
+
+
+def sentiment_coverage_hours(entries, ticker, window_hours=LONG_WINDOW_HOURS):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    cutoff = now - datetime.timedelta(hours=window_hours)
+    timestamps = [
+        timestamp
+        for h in entries
+        if h.get("ticker") == ticker
+        and (timestamp := _entry_timestamp(h)) is not None
+        and timestamp >= cutoff
+    ]
+    if not timestamps:
+        return 0.0
+    return min(window_hours, max(0.0, (now - min(timestamps)).total_seconds() / 3600))
 
 
 # ── message state helpers ────────────────────────────────────────────────
@@ -279,6 +325,93 @@ def mark_daily_allocation():
         f.write(now.isoformat())
 
 
+def save_execution_plan(recs, issued_at=None):
+    issued_at = issued_at or datetime.datetime.now(datetime.timezone.utc)
+    actionables = []
+    for rec in recs:
+        if rec.get("action") not in {"BUY", "SELL"}:
+            continue
+        actionables.append({
+            "ticker": rec["ticker"],
+            "action": rec["action"],
+            "target_shares": int(rec["target_shares"]),
+            "price": float(rec["price"]) if rec.get("price") else None,
+            "weight": float(rec["weight"]) if rec.get("weight") is not None else None,
+            "reason": rec.get("reason"),
+        })
+    payload = {
+        "schema_version": 1,
+        "issued_at": issued_at.isoformat(),
+        "expires_at": (issued_at + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)).isoformat(),
+        "recs": actionables,
+    }
+    _write_json_atomic(COMPETITION_EXECUTION_PLAN_FILE, payload)
+    return payload
+
+
+def clear_execution_plan():
+    try:
+        os.remove(COMPETITION_EXECUTION_PLAN_FILE)
+    except FileNotFoundError:
+        pass
+
+
+def load_active_execution_plan(ledger=None, now=None):
+    plan = _read_json(COMPETITION_EXECUTION_PLAN_FILE)
+    if not isinstance(plan, dict) or not isinstance(plan.get("recs"), list):
+        return None
+    try:
+        issued_at = datetime.datetime.fromisoformat(plan["issued_at"])
+        expires_at = datetime.datetime.fromisoformat(plan["expires_at"])
+    except (KeyError, TypeError, ValueError):
+        clear_execution_plan()
+        return None
+    if issued_at.tzinfo is None:
+        issued_at = issued_at.replace(tzinfo=datetime.timezone.utc)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=datetime.timezone.utc)
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    if now >= expires_at:
+        clear_execution_plan()
+        return None
+    ledger = ledger or load_competition_ledger()
+    matching_cutoff = issued_at - datetime.timedelta(minutes=2)
+    fills = {}
+    for trade in ledger.get("trades", []):
+        if not isinstance(trade, dict) or trade.get("source") != "marketwatch":
+            continue
+        timestamp = _entry_timestamp(trade)
+        if timestamp is None or timestamp < matching_cutoff:
+            continue
+        ticker = str(trade.get("ticker", "")).upper()
+        action = str(trade.get("action", "")).upper()
+        shares = trade.get("shares")
+        if not ticker or action not in {"BUY", "SELL"} or not isinstance(shares, int):
+            event = str(trade.get("event", ""))
+            match = re.match(r"^(BUY|SELL)\s+(\d+)\s+([A-Z.]+)\s+@", event)
+            if not match:
+                continue
+            action, shares, ticker = match.groups()
+        key = (ticker, action)
+        fills[key] = fills.get(key, 0) + int(shares)
+    remaining_recs = []
+    for rec in plan["recs"]:
+        key = (rec.get("ticker"), rec.get("action"))
+        remaining = max(0, int(rec.get("target_shares", 0)) - fills.get(key, 0))
+        if remaining:
+            updated = dict(rec)
+            updated["target_shares"] = remaining
+            remaining_recs.append(updated)
+    if not remaining_recs and plan["recs"]:
+        clear_execution_plan()
+        return None
+    result = dict(plan)
+    result["issued_at"] = issued_at.isoformat()
+    result["expires_at"] = expires_at.isoformat()
+    result["recs"] = remaining_recs
+    return result
+
+
 # ── news cycle helpers ────────────────────────────────────────────────────
 
 def check_news_cycle():
@@ -328,6 +461,9 @@ def _read_news_lock():
 
 
 def release_stale_news_lock(max_age_minutes=NEWS_LOCK_STALE_MINUTES):
+    if fcntl is not None:
+        # Linux advisory locks disappear automatically when a container exits.
+        return False
     lock = _read_news_lock()
     if not lock:
         return False
@@ -347,6 +483,31 @@ def release_stale_news_lock(max_age_minutes=NEWS_LOCK_STALE_MINUTES):
 
 
 def acquire_news_lock(attempts=5, retry_seconds=1):
+    global NEWS_LOCK_FD
+    if fcntl is not None:
+        if NEWS_LOCK_FD is not None:
+            return True
+        for attempt in range(attempts):
+            fd = os.open(NEWS_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                os.close(fd)
+                print(f"  [News] Lock held - retrying ({attempt + 1}/{attempts})...")
+                time.sleep(retry_seconds)
+                continue
+            payload = json.dumps({
+                "owner": NEWS_LOCK_OWNER,
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }).encode("utf-8")
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, payload)
+            NEWS_LOCK_FD = fd
+            return True
+        print("  [News] Could not acquire lock.")
+        return False
+
     for attempt in range(attempts):
         try:
             fd = os.open(NEWS_LOCK_FILE, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -365,6 +526,17 @@ def acquire_news_lock(attempts=5, retry_seconds=1):
 
 
 def release_news_lock():
+    global NEWS_LOCK_FD
+    if fcntl is not None:
+        if NEWS_LOCK_FD is None:
+            return
+        try:
+            fcntl.flock(NEWS_LOCK_FD, fcntl.LOCK_UN)
+        finally:
+            os.close(NEWS_LOCK_FD)
+            NEWS_LOCK_FD = None
+        return
+
     lock = _read_news_lock()
     if not lock:
         return
@@ -379,17 +551,51 @@ def release_news_lock():
 
 # ── competition ledger ────────────────────────────────────────────────────
 
+def _valid_competition_ledger(ledger):
+    return (
+        isinstance(ledger, dict)
+        and isinstance(ledger.get("holdings"), dict)
+        and isinstance(ledger.get("history"), list)
+    )
+
+
+def _normalize_competition_ledger(ledger):
+    ledger.setdefault("cash_balance", STARTING_CAPITAL)
+    trades = ledger.setdefault("trades", [])
+    if not isinstance(trades, list):
+        raise RuntimeError("Competition trade journal is unreadable.")
+    known = {entry.get("event_id") for entry in trades if isinstance(entry, dict) and entry.get("event_id")}
+    observations = []
+    for entry in ledger["history"]:
+        if isinstance(entry, dict) and entry.get("event"):
+            if not entry.get("event_id") or entry.get("event_id") not in known:
+                trades.append(entry)
+                if entry.get("event_id"):
+                    known.add(entry["event_id"])
+        else:
+            observations.append(entry)
+    ledger["history"] = observations
+    return ledger
+
+
 def load_competition_ledger():
     if os.path.exists(COMPETITION_LEDGER):
         ledger = _read_json(COMPETITION_LEDGER)
-        if isinstance(ledger, dict) and isinstance(ledger.get("holdings"), dict) and isinstance(ledger.get("history"), list):
-            ledger.setdefault("cash_balance", STARTING_CAPITAL)
-            return ledger
-        print("  [Ledger] Unreadable ledger; starting a new ledger rather than using corrupted balances.")
-    return {"cash_balance": STARTING_CAPITAL, "holdings": {}, "history": []}
+        if _valid_competition_ledger(ledger):
+            return _normalize_competition_ledger(ledger)
+        backup = _read_json(COMPETITION_LEDGER_BACKUP)
+        if _valid_competition_ledger(backup):
+            print("  [Ledger] Main ledger unreadable; restored the verified backup.")
+            _write_json_atomic(COMPETITION_LEDGER, backup)
+            return _normalize_competition_ledger(backup)
+        raise RuntimeError("Competition ledger and backup are unreadable; refusing to reset balances.")
+    return {"cash_balance": STARTING_CAPITAL, "holdings": {}, "history": [], "trades": []}
 
 
 def save_competition_ledger(ledger):
+    existing = _read_json(COMPETITION_LEDGER)
+    if _valid_competition_ledger(existing):
+        _write_json_atomic(COMPETITION_LEDGER_BACKUP, existing)
     _write_json_atomic(COMPETITION_LEDGER, ledger)
 
 
@@ -492,13 +698,16 @@ def _record_trade_unlocked(ticker, action, shares, price, trade_time=None, sourc
         "timestamp": ts,
         "portfolio_value": round(portfolio_value, 2),
         "event": f"{action.upper()} {shares} {ticker} @ ${price:.2f}",
+        "ticker": ticker,
+        "action": action.upper(),
+        "shares": shares,
+        "price": float(price),
         "source": source.strip(),
     }
     if event_id:
         history_event["event_id"] = event_id.strip()
-    ledger["history"].append(history_event)
+    ledger["trades"].append(history_event)
     save_competition_ledger(ledger)
-    generate_competition_chart(ledger)
     return ledger
 
 
@@ -595,7 +804,7 @@ def send_or_update_comp_dashboard(payload, image_path=None):
                         timeout=15
                     )
             else:
-                resp = requests.patch(edit_url, json={"content": payload}, timeout=15)
+                resp = requests.patch(edit_url, json={"content": payload, "attachments": []}, timeout=15)
             resp.raise_for_status()
             print(f"\n  [Comp Dash] Dashboard message ID [{existing_id}] edited.")
         else:
@@ -767,7 +976,10 @@ def build_news_roundup(alerts, et_now):
     return "\n".join(lines)
 
 
-def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, has_final_recs=False):
+def build_competition_dashboard(
+    ledger, predicted, recs, market_state, et_now,
+    has_final_recs=False, execution_expires_at=None,
+):
     pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL
     change = pv - STARTING_CAPITAL
     pct = (change / STARTING_CAPITAL) * 100
@@ -810,13 +1022,19 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
     rec_map = {rec["ticker"]: rec for rec in recs}
     actionables = [r for r in recs if r["action"] in ("BUY", "SELL")]
     if has_final_recs and actionables:
-        execute_by = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)
+        execute_by = execution_expires_at or (
+            datetime.datetime.now(datetime.timezone.utc)
+            + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)
+        )
+        if isinstance(execute_by, str):
+            execute_by = datetime.datetime.fromisoformat(execute_by)
         ex_hhmm = execute_by.strftime("%H:%M")
         lines.append("")
         lines.append(f"**Trade Plan — execute by {ex_hhmm} UTC**")
         for rec in actionables:
-            lines.append(f"`/trade ticker:{rec['ticker']} action:{rec['action'].lower()} shares:{rec['target_shares']} price:<actual_fill>`")
-        lines.append(f"`/hold` for any HOLD positions to confirm")
+            lines.append(f"`{rec['action']} {rec['target_shares']} {rec['ticker']}` on MarketWatch")
+        lines.append("The MarketWatch bridge imports verified fills and original timestamps automatically.")
+        lines.append("HOLD positions require no action.")
     elif not has_final_recs:
         lines.append("")
         if sync["enabled"] and not sync["healthy"]:
@@ -829,8 +1047,8 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
     lines.append("")
     lines.append("**Scoreboard:**")
     lines.append("```")
-    lines.append(f"{'Ticker':<8} {'Rank':>6} {'Sent':>6} {'Base':>6} {'Dec':>5} {'Qty':>5}")
-    dash = "-" * (8 + 6 + 6 + 6 + 5 + 5 + 5)
+    lines.append(f"{'Ticker':<8} {'Score':>6} {'Sent':>6} {'Health':>6} {'Wt':>6} {'Dec':>5} {'Qty':>5}  Why")
+    dash = "-" * 64
     lines.append(dash)
     for r in predicted:
         ticker = r["ticker"]
@@ -838,9 +1056,12 @@ def build_competition_dashboard(ledger, predicted, recs, market_state, et_now, h
         fund = r["health_score"]
         sent = r["sentiment"]
         rec = rec_map.get(ticker, {})
-        action = rec.get("action", "?")
+        action = rec.get("action", r.get("display_action", "DEFER"))
         shares = rec.get("target_shares", 0)
-        lines.append(f"{ticker:<8} {score:>6.1f} {sent:>+6.3f} {fund:>6.1f} {action:>5} {shares:>5}")
+        reason = rec.get("reason", r.get("display_reason", "not_selected"))
+        weight = rec.get("weight")
+        weight_text = f"{weight:.1%}" if isinstance(weight, (int, float)) else "-"
+        lines.append(f"{ticker:<8} {score:>6.1f} {sent:>+6.3f} {fund:>6.1f} {weight_text:>6} {action:>5} {shares:>5}  {reason[:18]}")
     lines.append(dash)
     lines.append("```")
     return "\n".join(lines)
@@ -1088,6 +1309,7 @@ def process_ticker(ticker, index, total, news_cache):
         _save_fundamentals_cache(fund_cache)
         status = "PASS (Bank Neutral)" if ticker in INSTITUTIONAL_BANKS else ("PASS" if solvency_ok else "FAIL")
     net_sentiment, penalty, headlines, rolling_pos, rolling_neg, rolling_count, long_sent, long_pos, long_neg, long_count = sentiment_gate(yf.Ticker(ticker), ticker, news_cache, skip_fetch=True)
+    long_coverage_hours = sentiment_coverage_hours(news_cache["headlines"], ticker)
     if solvency_ok and net_sentiment < 0.0:
         print(f"  [{index}/{total}] [Semantic Analysis]: Computational linguistics detect high rhetorical negative sentiment across public news sources, indicating structural headline risk that down-weights our core fundamental asset valuation.")
     momentum = _get_momentum(ticker)
@@ -1116,19 +1338,23 @@ def process_ticker(ticker, index, total, news_cache):
         "long_rolling_pos": long_pos,
         "long_rolling_neg": long_neg,
         "long_rolling_count": long_count,
+        "long_coverage_hours": long_coverage_hours,
     }
 
 
-# ── chart ────────────────────────────────────────────────────────────────
-
 _last_live_price = {}
+_last_price_fetch = {}
 
 def _get_price(ticker):
+    now = time.monotonic()
+    if ticker in _last_live_price and now - _last_price_fetch.get(ticker, 0) < PRICE_CACHE_SECONDS:
+        return _last_live_price[ticker]
     try:
         stock = yf.Ticker(ticker)
         price = stock.fast_info.last_price
         if price and price > 0:
             _last_live_price[ticker] = price
+            _last_price_fetch[ticker] = now
             return price
         return _last_live_price.get(ticker)
     except Exception:
@@ -1162,34 +1388,6 @@ def _holdings_value(ledger):
     return total
 
 
-def generate_competition_chart(ledger):
-    history = sorted(ledger.get("history", []), key=lambda h: h["timestamp"])
-    if len(history) < 2:
-        print(f"\n  {'='*70}")
-        print(f"  COMPETITION PORTFOLIO CHART")
-        print(f"{'='*70}")
-        print(f"  Not enough data points to render trend (need 2+ runs).")
-        return
-    timestamps = [datetime.datetime.fromisoformat(h["timestamp"]) for h in history]
-    values = [h["portfolio_value"] for h in history]
-    plt.figure(figsize=(12, 6), facecolor='#0d0d1a')
-    ax = plt.gca()
-    ax.set_facecolor('#1a1a2e')
-    ax.plot(timestamps, values, color='#00ff88', linewidth=2.5, label='Net Worth')
-    ax.axhline(y=STARTING_CAPITAL, color='#555555', linewidth=1.5, linestyle='--', label=f'Baseline ${STARTING_CAPITAL:,}')
-    ax.set_title('Competition Portfolio Performance', fontsize=16, fontweight='bold', color='white', pad=15)
-    ax.set_xlabel('Time (UTC)', fontsize=12, color='white')
-    ax.set_ylabel('Portfolio Value ($)', fontsize=12, color='white')
-    ax.legend(loc='upper left', fontsize=11)
-    ax.grid(True, alpha=0.3, color='#888888')
-    ax.tick_params(colors='white')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M'))
-    plt.tight_layout()
-    plt.savefig(COMPETITION_CHART, dpi=150)
-    plt.close()
-    print(f"  [Chart] {COMPETITION_CHART} saved ({len(history)} data points).")
-
-
 # ── full evaluation ──────────────────────────────────────────────────────
 
 def run_full_evaluation(news_cache):
@@ -1209,7 +1407,7 @@ def capped_score_weights(candidates):
         return {}
     weights = {r["ticker"]: 0.0 for r in candidates}
     remaining = list(candidates)
-    remaining_weight = 1.0
+    remaining_weight = 1.0 - MIN_CASH_RESERVE_PERCENT
     while remaining and remaining_weight > 0:
         total_score = sum(max(r["adjusted_score"], 0) for r in remaining)
         if total_score <= 0:
@@ -1232,8 +1430,38 @@ def capped_score_weights(candidates):
     return weights
 
 
+def _exposure_counts(tickers):
+    sector_counts = {}
+    factor_counts = {}
+    for ticker in tickers:
+        sector = TICKER_SECTORS.get(ticker, "Other")
+        sector_counts[sector] = sector_counts.get(sector, 0) + 1
+        for factor, members in FACTOR_BUCKETS.items():
+            if ticker in members:
+                factor_counts[factor] = factor_counts.get(factor, 0) + 1
+    return sector_counts, factor_counts
+
+
+def _exposure_limit_reason(ticker, sector_counts, factor_counts):
+    for factor, members in FACTOR_BUCKETS.items():
+        if ticker in members and factor_counts.get(factor, 0) >= MAX_FACTOR_POSITIONS:
+            return f"{factor}_cap"
+    sector = TICKER_SECTORS.get(ticker, "Other")
+    if sector_counts.get(sector, 0) >= MAX_SECTOR_POSITIONS:
+        return "sector_cap"
+    return None
+
+
+def _add_exposure(ticker, sector_counts, factor_counts):
+    sector = TICKER_SECTORS.get(ticker, "Other")
+    sector_counts[sector] = sector_counts.get(sector, 0) + 1
+    for factor, members in FACTOR_BUCKETS.items():
+        if ticker in members:
+            factor_counts[factor] = factor_counts.get(factor, 0) + 1
+
+
 def compute_recommendations(predicted, ledger, all_predictions=None):
-    """Build bounded recommendations from the top ranks and the complete scored universe."""
+    """Build conviction-gated recommendations from the ranked allocation set."""
     if all_predictions is None:
         all_predictions = []
         if os.path.exists(COMPETITION_PREDICTION_FILE):
@@ -1242,11 +1470,11 @@ def compute_recommendations(predicted, ledger, all_predictions=None):
                 all_predictions = loaded
     all_prediction_map = {r["ticker"]: r for r in all_predictions if isinstance(r, dict) and "ticker" in r}
     ranked_tickers = {r["ticker"] for r in predicted}
-    eligible = [r for r in predicted if r.get("sentiment", 0) >= SENTIMENT_BUY_THRESHOLD]
     cash = max(0.0, ledger["cash_balance"])
     recs = []
     sold_tickers = set()
     full_exit_tickers = set()
+    decisions = {}
 
     def add_sell(ticker, shares, price, reason, full_exit=False):
         recs.append({
@@ -1287,27 +1515,72 @@ def compute_recommendations(predicted, ledger, all_predictions=None):
             if gain_pct >= PROFIT_TAKE_PERCENT:
                 add_sell(ticker, max(1, pos["shares"] // 2), price, "profit_take")
 
-    # A held name outside the current top 12, missing from the universe, or below the
-    # sentiment threshold receives a full exit rather than silently disappearing.
+    # A held name outside the ranked allocation set or with negative sentiment exits.
     for ticker, pos in ledger["holdings"].items():
         if ticker in sold_tickers:
             continue
         scored = all_prediction_map.get(ticker)
-        if scored is None or ticker not in ranked_tickers or scored.get("sentiment", 0) < SENTIMENT_BUY_THRESHOLD:
+        if scored is None or ticker not in ranked_tickers or scored.get("sentiment", 0) < SENTIMENT_EXIT_THRESHOLD:
             price = _get_price(ticker)
             add_sell(ticker, pos["shares"], price, "rank_or_sentiment_exit", full_exit=True)
 
     remaining_holdings = len(ledger["holdings"]) - len(full_exit_tickers)
-    slots = max(0, MAX_PORTFOLIO_HOLDINGS - remaining_holdings)
-    buy_candidates = [
-        r for r in eligible
-        if r["ticker"] not in ledger["holdings"] and r["ticker"] not in sold_tickers
-    ][:min(MAX_BUYS_PER_CYCLE, slots)]
-    buy_tickers = []
+    sector_counts, factor_counts = _exposure_counts(
+        ticker for ticker in ledger["holdings"] if ticker not in full_exit_tickers
+    )
+    planned_holdings = remaining_holdings
+    buy_candidates = []
+
+    for candidate in predicted:
+        ticker = candidate["ticker"]
+        sentiment = candidate.get("sentiment", 0.0)
+        long_sentiment = candidate.get("long_sentiment", 0.0)
+        if ticker in ledger["holdings"] or ticker in sold_tickers:
+            continue
+        if not candidate.get("passed", False):
+            decisions[ticker] = ("SKIP", "solvency")
+            continue
+        if sentiment < SENTIMENT_BUY_THRESHOLD:
+            decisions[ticker] = ("SKIP", "below_conviction")
+            continue
+        if len(buy_candidates) >= MAX_BUYS_PER_CYCLE:
+            decisions[ticker] = ("DEFER", "cycle_cap")
+            continue
+        if planned_holdings >= MAX_PORTFOLIO_HOLDINGS:
+            decisions[ticker] = ("DEFER", "portfolio_cap")
+            continue
+        if (
+            planned_holdings >= CORE_PORTFOLIO_HOLDINGS
+            and candidate.get("long_coverage_hours", 0.0) < MIN_PERSISTENT_COVERAGE_HOURS
+        ):
+            decisions[ticker] = ("DEFER", "long_signal_warmup")
+            continue
+        if planned_holdings >= CORE_PORTFOLIO_HOLDINGS and (
+            sentiment < PERSISTENT_SENTIMENT_THRESHOLD
+            or long_sentiment < PERSISTENT_SENTIMENT_THRESHOLD
+        ):
+            decisions[ticker] = ("DEFER", "reserve_slot")
+            continue
+        exposure_reason = _exposure_limit_reason(ticker, sector_counts, factor_counts)
+        if exposure_reason:
+            decisions[ticker] = ("DEFER", exposure_reason)
+            continue
+        price = _get_price(ticker)
+        if not price or price <= 0:
+            decisions[ticker] = ("DEFER", "price_unavailable")
+            continue
+        selected = dict(candidate)
+        selected["price"] = price
+        selected["allocation_type"] = "core" if planned_holdings < CORE_PORTFOLIO_HOLDINGS else "satellite"
+        buy_candidates.append(selected)
+        decisions[ticker] = ("BUY", f"{selected['allocation_type']}_conviction")
+        planned_holdings += 1
+        _add_exposure(ticker, sector_counts, factor_counts)
+
     buy_weights = capped_score_weights(buy_candidates)
     for candidate in buy_candidates:
         weight = buy_weights.get(candidate["ticker"], 0.0)
-        price = _get_price(candidate["ticker"])
+        price = candidate["price"]
         if price and price > 0:
             target_shares = int((cash * weight) / price)
             if target_shares > 0:
@@ -1316,29 +1589,47 @@ def compute_recommendations(predicted, ledger, all_predictions=None):
                     "action": "BUY",
                     "target_shares": target_shares,
                     "price": price,
-                    "reason": "ranked_buy",
+                    "weight": weight,
+                    "reason": decisions[candidate["ticker"]][1],
                 })
-                buy_tickers.append(candidate["ticker"])
 
     for ticker, pos in ledger["holdings"].items():
         if ticker in sold_tickers:
             continue
         recs.append({"ticker": ticker, "action": "HOLD", "target_shares": pos["shares"], "price": _get_price(ticker)})
 
-    return recs, predicted
+    display = []
+    rec_map = {rec["ticker"]: rec for rec in recs}
+    for prediction in predicted:
+        row = dict(prediction)
+        ticker = row["ticker"]
+        rec = rec_map.get(ticker)
+        if rec:
+            row["display_action"] = rec["action"]
+            row["display_reason"] = rec.get("reason", "holding")
+        elif ticker in decisions:
+            row["display_action"], row["display_reason"] = decisions[ticker]
+        elif ticker in ledger["holdings"]:
+            row["display_action"] = "HOLD"
+            row["display_reason"] = "holding"
+        else:
+            row["display_action"] = "DEFER"
+            row["display_reason"] = "not_selected"
+        display.append(row)
+    return recs, display
 
 
 # ── viz update ───────────────────────────────────────────────────────────
 
-def visualization_update(record_chart=True):
+def visualization_update(record_history=True):
     with COMPETITION_LEDGER_LOCK:
-        return _visualization_update_unlocked(record_chart)
+        return _visualization_update_unlocked(record_history)
 
 
-def _visualization_update_unlocked(record_chart=True):
+def _visualization_update_unlocked(record_history=True):
     ledger = load_competition_ledger()
     portfolio_value = ledger["cash_balance"] + _holdings_value(ledger)
-    if record_chart:
+    if record_history:
         ledger["history"].append({
             "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
             "portfolio_value": round(portfolio_value, 2),
@@ -1347,7 +1638,6 @@ def _visualization_update_unlocked(record_chart=True):
         if len(ledger["history"]) > MAX_HISTORY_POINTS:
             ledger["history"] = ledger["history"][-MAX_HISTORY_POINTS:]
         save_competition_ledger(ledger)
-        generate_competition_chart(ledger)
     else:
         if ledger["history"]:
             ledger["history"][-1]["portfolio_value"] = round(portfolio_value, 2)
@@ -1362,7 +1652,9 @@ def _handle_reset_unlocked():
         GATE_FILE, NEWS_CACHE_FILE, NEWS_CACHE_BACKUP,
         MESSAGE_STATE_FILE, NEWS_MESSAGE_STATE_FILE,
         NEWS_CYCLE_FILE,
-        COMPETITION_LEDGER, COMPETITION_MESSAGE_STATE, COMPETITION_PREDICTION_FILE,
+        COMPETITION_LEDGER, COMPETITION_LEDGER_BACKUP,
+        COMPETITION_MESSAGE_STATE, COMPETITION_PREDICTION_FILE,
+        COMPETITION_EXECUTION_PLAN_FILE, ENGINE_HEALTH_FILE,
         FUNDAMENTALS_CACHE_FILE, OBSERVATION_FILE, RUN_MODE_FILE, MARKETWATCH_SYNC_FILE,
     ]
     statuses = {}
@@ -1388,9 +1680,6 @@ def _handle_reset_unlocked():
             statuses[name] = "deleted"
         else:
             statuses[name] = "not found"
-    if os.path.exists(COMPETITION_CHART):
-        os.remove(COMPETITION_CHART)
-        statuses[os.path.basename(COMPETITION_CHART)] = "deleted"
     print(f"\n{'='*80}")
     print(f"  SYSTEM RESET")
     print(f"{'='*80}")
@@ -1488,8 +1777,12 @@ class EngineRunner:
         self._trigger = threading.Event()
         self._busy = threading.Event()
         self._reload_state = threading.Event()
+        self._failed = threading.Event()
         self._cycle_guard = threading.Lock()
         self._thread = None
+        self._failure = None
+        self._last_heartbeat_monotonic = time.monotonic()
+        self._last_health_write_monotonic = 0.0
         release_stale_news_lock()
         self.status = {
             "mode": run_mode,
@@ -1504,8 +1797,39 @@ class EngineRunner:
         self._lock = threading.Lock()
 
     def start(self):
-        self._thread = threading.Thread(target=self._run_loop, daemon=True, name="Engine")
+        self._thread = threading.Thread(target=self._run_supervised, daemon=True, name="Engine")
         self._thread.start()
+
+    def _run_supervised(self):
+        try:
+            self._run_loop()
+        except Exception as exc:
+            self._failure = repr(exc)
+            self._failed.set()
+            traceback.print_exc()
+
+    def is_healthy(self):
+        if self._failed.is_set() or not self._thread or not self._thread.is_alive():
+            return False
+        if not self._paused.is_set():
+            return True
+        return time.monotonic() - self._last_heartbeat_monotonic <= ENGINE_HEALTH_MAX_STALENESS_SECONDS
+
+    def failure_detail(self):
+        return self._failure
+
+    def _heartbeat(self, force=False):
+        now_monotonic = time.monotonic()
+        self._last_heartbeat_monotonic = now_monotonic
+        if not force and now_monotonic - self._last_health_write_monotonic < 30:
+            return
+        payload = {
+            "healthy": True,
+            "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "mode": self.run_mode,
+        }
+        _write_json_atomic(ENGINE_HEALTH_FILE, payload)
+        self._last_health_write_monotonic = now_monotonic
 
     def stop(self):
         self._stopped.set()
@@ -1557,6 +1881,7 @@ class EngineRunner:
                 return
             time.sleep(min(interval, seconds - elapsed))
             elapsed += interval
+            self._heartbeat()
 
     def get_status(self):
         with self._lock:
@@ -1573,15 +1898,17 @@ class EngineRunner:
         print(f"{'='*80}")
 
         log_sentiment_backend()
+        self._heartbeat(force=True)
         news_cache = load_news_cache()
         release_stale_news_lock()
-        repair_news_cache(news_cache)
+        repair_and_persist_news_cache(news_cache)
 
         last_viz_time = 0.0
-        last_chart_time = 0.0
+        last_history_time = 0.0
         news_just_fetched_this_cycle = False
 
         while not self._stopped.is_set():
+            self._heartbeat()
             self._paused.wait()
             if self._stopped.is_set():
                 break
@@ -1591,7 +1918,7 @@ class EngineRunner:
                 self._busy.set()
             if self._reload_state.is_set():
                 news_cache = load_news_cache()
-                repair_news_cache(news_cache)
+                repair_and_persist_news_cache(news_cache)
                 self._reload_state.clear()
 
             cycle_start = datetime.datetime.now(datetime.timezone.utc)
@@ -1624,7 +1951,7 @@ class EngineRunner:
                     try:
                         # The lock protects both fetch and save; reload the latest shared cache first.
                         news_cache = load_news_cache()
-                        repair_news_cache(news_cache)
+                        repair_and_persist_news_cache(news_cache)
                         pruned, window_hours = prune_news_cache(news_cache)
                         if pruned > 0:
                             print(f"  [Cache] Pruned {pruned} headline(s) older than {window_hours}h window.")
@@ -1648,29 +1975,42 @@ class EngineRunner:
                 ledger = load_competition_ledger()
                 recs, display = compute_recommendations(predicted, ledger, ranked_predictions)
                 daily_allowed = check_daily_gate()
-                has_final_recs = daily_allowed and market_state == "MARKET_OPEN" and marketwatch_sync_status()["healthy"]
-
-                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=has_final_recs)
-
-                if has_final_recs:
+                sync_healthy = marketwatch_sync_status()["healthy"]
+                should_issue = daily_allowed and market_state == "MARKET_OPEN" and sync_healthy
+                active_plan = None
+                dashboard_recs = recs
+                execution_expires_at = None
+                if should_issue:
+                    if any(rec.get("action") in {"BUY", "SELL"} for rec in recs):
+                        active_plan = save_execution_plan(recs)
+                        dashboard_recs = active_plan["recs"]
+                        execution_expires_at = active_plan["expires_at"]
+                    else:
+                        clear_execution_plan()
                     mark_daily_allocation()
                     self._update_status(last_run_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
                     print(f"  [Gate] Daily allocation window opened — recommendations issued.")
                 else:
                     print(f"  [Gate] Prediction updated — gate cooldown.")
 
-                send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
+                payload = build_competition_dashboard(
+                    ledger, display, dashboard_recs, market_state, et_now,
+                    has_final_recs=should_issue,
+                    execution_expires_at=execution_expires_at,
+                )
+
+                send_or_update_comp_dashboard(payload)
 
                 print(f"\n  Next full cycle +{LOOP_INTERVAL_MINUTES}min.")
-                last_viz_time = 0.0
+                last_viz_time = now_ts
 
             # ── Clock 3: 60-second visualization ──
             if now_ts - last_viz_time >= 60:
                 last_viz_time = now_ts
-                record_chart = (now_ts - last_chart_time >= 300)
-                if record_chart:
-                    last_chart_time = now_ts
-                ledger = visualization_update(record_chart=record_chart)
+                record_history = (now_ts - last_history_time >= 300)
+                if record_history:
+                    last_history_time = now_ts
+                ledger = visualization_update(record_history=record_history)
                 self._update_status(holdings_count=len(ledger["holdings"]), portfolio_value=ledger["history"][-1]["portfolio_value"] if ledger["history"] else STARTING_CAPITAL)
 
                 # Rebuild dashboard with latest ledger data + stored prediction
@@ -1681,12 +2021,19 @@ class EngineRunner:
                         ranked_predictions = loaded
                 predicted = ranked_predictions[:MAX_PORTFOLIO_HOLDINGS]
                 recs, display = compute_recommendations(predicted, ledger, ranked_predictions) if predicted else ([], [])
-                daily_allowed = check_daily_gate()
-                has_final_recs = daily_allowed and market_state == "MARKET_OPEN" and marketwatch_sync_status()["healthy"]
-                payload = build_competition_dashboard(ledger, display, recs, market_state, et_now, has_final_recs=has_final_recs)
-                send_or_update_comp_dashboard(payload, image_path=COMPETITION_CHART if os.path.exists(COMPETITION_CHART) else None)
+                active_plan = load_active_execution_plan(ledger)
+                sync_healthy = marketwatch_sync_status()["healthy"]
+                has_final_recs = bool(active_plan) and market_state == "MARKET_OPEN" and sync_healthy
+                dashboard_recs = active_plan["recs"] if active_plan else recs
+                payload = build_competition_dashboard(
+                    ledger, display, dashboard_recs, market_state, et_now,
+                    has_final_recs=has_final_recs,
+                    execution_expires_at=active_plan.get("expires_at") if active_plan else None,
+                )
+                send_or_update_comp_dashboard(payload)
 
             self._sleep_with_trigger(5)
             self.clear_trigger()
             with self._cycle_guard:
                 self._busy.clear()
+            self._heartbeat()

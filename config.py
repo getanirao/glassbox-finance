@@ -17,19 +17,30 @@ LONG_WINDOW_HOURS = 504
 LONG_SENTIMENT_WEIGHT = 0.3
 DECAY_HALF_LIFE_HOURS = 336
 FINBERT_TEMPERATURE = 0.5
-SENTIMENT_BUY_THRESHOLD = 0.0
-MAX_BUYS_PER_CYCLE = 6
+SENTIMENT_BUY_THRESHOLD = 0.15
+SENTIMENT_EXIT_THRESHOLD = 0.0
+PERSISTENT_SENTIMENT_THRESHOLD = 0.35
+MAX_BUYS_PER_CYCLE = 8
 MAX_POSITION_WEIGHT = 0.30
+MIN_CASH_RESERVE_PERCENT = 0.10
 SENTIMENT_IMPACT = 0.30
 DOWNSIDE_SENTIMENT_WEIGHT = 1.0
 BUSINESS_RISK_SENTIMENT_FLOOR = -0.65
 WATCHLIST_SCANNER_LIMIT = 75
-MAX_PORTFOLIO_HOLDINGS = 12
+CORE_PORTFOLIO_HOLDINGS = 6
+MAX_PORTFOLIO_HOLDINGS = 8
+MAX_SECTOR_POSITIONS = 2
+MAX_FACTOR_POSITIONS = 2
 NEWS_CYCLE_HOURS = 1
 NEWS_RATE_MIN = 1.5
 NEWS_RATE_MAX = 3.5
 NEWS_LOCK_STALE_MINUTES = 90
 MAX_HEADLINES_PER_TICKER = 30
+MAX_LONG_HEADLINES_PER_TICKER_DAY = 5
+MIN_PERSISTENT_COVERAGE_HOURS = 72
+PRICE_CACHE_SECONDS = 60
+FINBERT_INTRA_OP_THREADS = max(1, int(os.getenv("FINBERT_INTRA_OP_THREADS", "2")))
+SENTIMENT_SCORING_VERSION = "modern-finbert-int8-t05-v1"
 
 ENABLE_ARTICLE_SUMMARIZATION = os.getenv("ENABLE_ARTICLE_SUMMARIZATION", "false").lower() in {"1", "true", "yes"}
 SUMMARIZE_PROVIDER = os.getenv("SUMMARIZE_PROVIDER", "openai").lower()
@@ -49,12 +60,15 @@ MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 INSTITUTIONAL_BANKS = {"JPM", "GS", "BAC", "MS", "C"}
 
 COMPETITION_LEDGER = os.path.join(DATA_DIR, "competition_ledger.json")
-COMPETITION_CHART = os.path.join(DATA_DIR, "competition_chart.png")
+COMPETITION_LEDGER_BACKUP = os.path.join(DATA_DIR, "competition_ledger.backup.json")
 COMPETITION_MESSAGE_STATE = os.path.join(DATA_DIR, ".competition_message_state")
 COMPETITION_PREDICTION_FILE = os.path.join(DATA_DIR, ".competition_prediction.json")
+COMPETITION_EXECUTION_PLAN_FILE = os.path.join(DATA_DIR, ".competition_execution_plan.json")
 FUNDAMENTALS_CACHE_FILE = os.path.join(DATA_DIR, ".fundamentals_cache.json")
 FUNDAMENTALS_CACHE_TTL_HOURS = 24
 EXECUTION_WINDOW_MINUTES = 15
+ENGINE_HEALTH_FILE = os.path.join(DATA_DIR, ".engine_health.json")
+ENGINE_HEALTH_MAX_STALENESS_SECONDS = 900
 
 # Opt-in bridge; execution recommendations fail closed until a verified snapshot arrives.
 MARKETWATCH_SYNC_ENABLED = os.getenv("MARKETWATCH_SYNC_ENABLED", "false").lower() in {"1", "true", "yes"}
@@ -96,6 +110,21 @@ TICKERS = [
     "NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "PEG", "ED", "WEC",
     "JPM", "GS", "BAC", "MS", "C",
 ]
+
+TICKER_SECTORS = {
+    **dict.fromkeys({"AAPL", "MSFT", "GOOGL", "META", "NVDA", "INTC", "AMD", "CSCO", "CRM", "ORCL", "IBM", "ADBE", "NOW"}, "Technology"),
+    **dict.fromkeys({"NFLX", "DIS"}, "Communication"),
+    **dict.fromkeys({"JNJ", "PFE", "UNH", "ABBV", "MRK", "ABT", "TMO", "LLY", "BMY", "MDT", "DHR", "AMGN"}, "Healthcare"),
+    **dict.fromkeys({"XOM", "CVX", "COP", "SLB", "EOG", "OXY", "HAL", "MPC", "PSX", "VLO"}, "Energy"),
+    **dict.fromkeys({"AMZN", "TSLA", "HD", "MCD", "NKE", "SBUX", "LOW", "BKNG", "TGT", "TJX", "ROST"}, "Consumer"),
+    **dict.fromkeys({"CAT", "GE", "BA", "HON", "RTX", "UPS", "UNP", "LMT", "GD", "CARR", "EMR", "ETN"}, "Industrials"),
+    **dict.fromkeys({"NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE", "PEG", "ED", "WEC"}, "Utilities"),
+    **dict.fromkeys({"JPM", "GS", "BAC", "MS", "C"}, "Financials"),
+}
+
+FACTOR_BUCKETS = {
+    "growth_ai": frozenset({"META", "GOOGL", "MSFT", "NVDA", "NFLX"}),
+}
 
 TICKER_NAMES = {
     "AAPL": "apple", "MSFT": "microsoft", "GOOGL": "alphabet", "META": "meta",

@@ -12,6 +12,7 @@ from config import (
     MARKETWATCH_SYNC_ENABLED,
     MARKETWATCH_SYNC_FILE,
     MARKETWATCH_SYNC_HOST,
+    MARKETWATCH_SYNC_MAX_STALENESS_SECONDS,
     MARKETWATCH_SYNC_PORT,
     MARKETWATCH_SYNC_TOKEN,
     STARTING_CAPITAL,
@@ -57,6 +58,21 @@ def _load_state():
 
 def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def _bridge_health(state):
+    status = str(state.get("status", "awaiting_baseline"))
+    observed_raw = state.get("last_observed_at")
+    if not observed_raw:
+        return {"status": "awaiting_baseline", "healthy": False, "age_seconds": None}
+    try:
+        observed_at = _parse_timestamp(observed_raw, "last_observed_at")
+    except ValueError:
+        return {"status": "awaiting_baseline", "healthy": False, "age_seconds": None}
+    age_seconds = max(0, round((datetime.datetime.now(datetime.timezone.utc) - observed_at).total_seconds()))
+    if age_seconds > MARKETWATCH_SYNC_MAX_STALENESS_SECONDS:
+        return {"status": "stale", "healthy": False, "age_seconds": age_seconds}
+    return {"status": status, "healthy": status == "healthy", "age_seconds": age_seconds}
 
 
 def _parse_timestamp(value, label):
@@ -136,25 +152,24 @@ def _normalized_snapshot(snapshot):
             raise ValueError(f"Portfolio contains duplicate ticker {ticker}.")
         normalized[ticker] = _positive_int(row.get("shares"), "snapshot.positions.shares")
     cash = snapshot.get("cash_balance")
-    if cash is not None:
-        cash = _finite_number(cash, "snapshot.cash_balance", allow_zero=True)
+    if cash is None:
+        raise ValueError("The extension must capture visible MarketWatch cash before syncing.")
+    cash = _finite_number(cash, "snapshot.cash_balance", allow_zero=True)
     return {"positions": normalized, "cash_balance": cash}
 
 
 def _ledger_is_fresh(ledger):
-    history = ledger.get("history", [])
     return (
         not ledger.get("holdings")
         and abs(float(ledger.get("cash_balance", STARTING_CAPITAL)) - STARTING_CAPITAL) < 0.01
-        # Visualization points do not represent executed trades and are safe to retain.
-        and not any(isinstance(entry, dict) and entry.get("event") for entry in history)
+        and not ledger.get("trades")
     )
 
 
 def _ledger_event_ids(ledger):
     return {
         str(entry["event_id"])
-        for entry in ledger.get("history", [])
+        for entry in ledger.get("trades", [])
         if isinstance(entry, dict) and entry.get("source") == "marketwatch" and entry.get("event_id")
     }
 
@@ -188,7 +203,8 @@ def process_snapshot(envelope):
     with SYNC_LOCK, COMPETITION_LEDGER_LOCK:
         state = _load_state()
         ledger = load_competition_ledger()
-        if not state["baseline_complete"] and not _ledger_is_fresh(ledger):
+        bridge_owned_ledger = bool(_ledger_event_ids(ledger))
+        if not state["baseline_complete"] and not _ledger_is_fresh(ledger) and not bridge_owned_ledger:
             state.update({
                 "status": "blocked_existing_ledger",
                 "last_observed_at": observed_at.isoformat(),
@@ -218,7 +234,7 @@ def process_snapshot(envelope):
             mismatch = str(exc)
 
         state.update({
-            "baseline_complete": mismatch is None,
+            "baseline_complete": bool(state["baseline_complete"] or mismatch is None),
             "status": "healthy" if mismatch is None else "blocked_reconciliation",
             "last_observed_at": observed_at.isoformat(),
             "last_received_at": _now_iso(),
@@ -267,12 +283,12 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path != "/v1/marketwatch/health":
             self._send(404, {"detail": "not found"})
             return
-        state = _load_state()
+        health = _bridge_health(_load_state())
         self._send(200, {
             "service": "marketwatch-sync",
             "enabled": MARKETWATCH_SYNC_ENABLED,
             "configured": bool(MARKETWATCH_SYNC_TOKEN),
-            "status": state["status"],
+            **health,
         })
 
     def do_POST(self):
@@ -312,8 +328,8 @@ class MarketWatchSyncServer:
         if not MARKETWATCH_SYNC_ENABLED:
             print("  [MarketWatch Sync] Disabled. Set MARKETWATCH_SYNC_ENABLED=true after HTTPS is configured.")
             return False
-        if not MARKETWATCH_SYNC_TOKEN:
-            print("  [MarketWatch Sync] Disabled: MARKETWATCH_SYNC_TOKEN is not configured.")
+        if len(MARKETWATCH_SYNC_TOKEN) < 32:
+            print("  [MarketWatch Sync] Disabled: MARKETWATCH_SYNC_TOKEN must contain at least 32 characters.")
             return False
         self._server = ThreadingHTTPServer((MARKETWATCH_SYNC_HOST, MARKETWATCH_SYNC_PORT), _Handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True, name="MarketWatchSync")

@@ -6,8 +6,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-os.environ["MPLBACKEND"] = "Agg"
-
 from config import DATA_DIR
 from engine import EngineRunner, handle_reset, run_news_worker
 
@@ -111,10 +109,21 @@ def main():
         bot = GlassboxBot(engine_runner=engine)
 
         async def run_bot():
+            bot_runner = asyncio.create_task(bot.start(token))
             try:
-                await bot.start(token)
+                while not bot_runner.done():
+                    await asyncio.sleep(5)
+                    if engine and not engine.is_healthy():
+                        detail = engine.failure_detail() or "engine heartbeat stopped"
+                        print(f"  [Watchdog] Engine unhealthy: {detail}")
+                        await bot.close()
+                        raise RuntimeError(f"Engine watchdog stopped the process: {detail}")
+                await bot_runner
             except KeyboardInterrupt:
                 await bot.close()
+            finally:
+                if not bot_runner.done():
+                    bot_runner.cancel()
 
         try:
             asyncio.run(run_bot())

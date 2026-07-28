@@ -76,6 +76,8 @@ class EngineCog(commands.Cog):
         holdings = st.get("holdings_count", 0)
         pv = st.get("portfolio_value", 0)
         news_last = st.get("news_last_run", "never")
+        from engine import marketwatch_sync_status
+        bridge = marketwatch_sync_status()
         lines = [
             f"**Glassbox Finance — Competition Engine Status**",
             f"",
@@ -83,6 +85,7 @@ class EngineCog(commands.Cog):
             f"Market: `{market}`",
             f"Paused: `{paused}`",
             f"Portfolio: `${pv:,.2f}`  |  Holdings: `{holdings} / {MAX_PORTFOLIO_HOLDINGS}`",
+            f"MarketWatch bridge: `{bridge.get('status', 'unknown').upper()}`",
             f"Last Allocation: `{last}`",
             f"Last News Stream: `{news_last}`",
             f"Started: `{uptime}`",
@@ -199,101 +202,20 @@ class QueryCog(commands.Cog):
         lines.append("```")
         await interaction.response.send_message("\n".join(lines), ephemeral=False)
 
-    @app_commands.command(name="chart", description="Show latest competition performance chart")
+    @app_commands.command(name="trades", description="Show the durable MarketWatch execution journal")
     @app_commands.check(trader_check)
-    async def cmd_chart(self, interaction: discord.Interaction):
-        from engine import COMPETITION_CHART
-        if not os.path.exists(COMPETITION_CHART):
-            await interaction.response.send_message("No chart generated yet.", ephemeral=True)
+    async def cmd_trades(self, interaction: discord.Interaction):
+        from engine import load_competition_ledger
+        trades = load_competition_ledger().get("trades", [])
+        if not trades:
+            await interaction.response.send_message("No MarketWatch trades recorded yet.", ephemeral=True)
             return
-        await interaction.response.send_message(file=discord.File(COMPETITION_CHART), ephemeral=False)
-
-    @app_commands.command(name="trade", description="Log a real trade for the competition ledger")
-    @app_commands.check(trader_check)
-    async def cmd_trade(self, interaction: discord.Interaction, ticker: str, action: str, shares: int, price: float, time: str = ""):
-        await interaction.response.defer()
-        from engine import record_trade
-        ticker = ticker.upper()
-        action = action.lower()
-        if action not in ("buy", "sell"):
-            await interaction.followup.send("Action must be `buy` or `sell`.", ephemeral=True)
-            return
-        if shares <= 0:
-            await interaction.followup.send("Shares must be positive.", ephemeral=True)
-            return
-        try:
-            ledger = record_trade(ticker, action, shares, price, trade_time=time.strip() or None)
-        except ValueError as exc:
-            await interaction.followup.send(str(exc), ephemeral=True)
-            return
-        pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else 0
-        ts = time if time else ledger["history"][-1]["timestamp"]
-        lines = [
-            f"**Trade Logged** — {action.upper()} {shares} {ticker} @ ${price:.2f}",
-            f"Time: {ts}  |  Cash: ${ledger['cash_balance']:,.2f}  |  Portfolio: ${pv:,.2f}",
-            f"Holdings: {len(ledger['holdings'])} positions",
-        ]
-        await interaction.followup.send("\n".join(lines), ephemeral=False)
-
-    @app_commands.command(name="bulk-trade", description="Execute multiple trades from a pasted block")
-    @app_commands.check(trader_check)
-    async def cmd_bulk_trade(self, interaction: discord.Interaction, block: str):
-        await interaction.response.defer()
-        from engine import record_trade, record_hold, load_competition_ledger
-        lines = [l.strip() for l in block.strip().split("\n") if l.strip()]
-        results = []
-        for line in lines:
-            parts = line.split()
-            if len(parts) < 2:
-                results.append(f"`{line}` — SKIP (need: TICKER ACTION SHARES PRICE [TIME])")
-                continue
-            ticker = parts[0].upper()
-            action = parts[1].lower()
-            if action == "hold":
-                if record_hold(ticker):
-                    results.append(f"`{ticker} HOLD` — OK")
-                else:
-                    results.append(f"`{ticker} HOLD` — SKIP (not in ledger)")
-                continue
-            if len(parts) < 4:
-                results.append(f"`{line}` — SKIP (need: TICKER ACTION SHARES PRICE [TIME])")
-                continue
-            try:
-                shares = int(parts[2])
-                price = float(parts[3])
-            except ValueError:
-                results.append(f"`{line}` — SKIP (invalid shares or price)")
-                continue
-            time_arg = parts[4] if len(parts) >= 5 else ""
-            if action not in ("buy", "sell") or shares <= 0:
-                results.append(f"`{line}` — SKIP (action must be buy/sell/hold, shares > 0)")
-                continue
-            try:
-                record_trade(ticker, action, shares, price, trade_time=time_arg.strip() or None)
-            except ValueError as exc:
-                results.append(f"`{ticker} {action.upper()} {shares}` — SKIP ({exc})")
-                continue
-            results.append(f"`{ticker} {action.upper()} {shares} @ ${price:.2f}` — OK")
-        ledger = load_competition_ledger()
-        pv = ledger["history"][-1]["portfolio_value"] if ledger["history"] else 0
-        out = [
-            f"**Bulk Trade Results**  |  Cash: ${ledger['cash_balance']:,.2f}  |  Portfolio: ${pv:,.2f}",
-            f"Holdings: {len(ledger['holdings'])} positions",
-            "```",
-            "\n".join(results),
-            "```",
-        ]
-        await interaction.followup.send("\n".join(out), ephemeral=False)
-
-    @app_commands.command(name="hold", description="Confirm a HOLD recommendation from the engine")
-    @app_commands.check(trader_check)
-    async def cmd_hold(self, interaction: discord.Interaction, ticker: str):
-        from engine import record_hold
-        ticker = ticker.upper()
-        if record_hold(ticker):
-            await interaction.response.send_message(f"HOLD confirmed for {ticker}.", ephemeral=False)
-        else:
-            await interaction.response.send_message(f"Cannot confirm HOLD for {ticker}: it is not in the ledger.", ephemeral=True)
+        lines = [f"**MarketWatch Trade Journal**  ({len(trades)} fills)", "```"]
+        for trade in trades[-20:]:
+            timestamp = str(trade.get("timestamp", "unknown")).replace("T", " ")[:19]
+            lines.append(f"{timestamp}  {trade.get('event', 'unknown fill')}")
+        lines.append("```")
+        await interaction.response.send_message("\n".join(lines), ephemeral=False)
 
     @app_commands.command(name="help", description="Show available commands and their usage")
     async def cmd_help(self, interaction: discord.Interaction):
@@ -304,11 +226,10 @@ class QueryCog(commands.Cog):
             f"`/status` — Engine state, clock, portfolio value",
             f"`/news` — News cache summary with sentiment",
             f"`/history` — Portfolio value history (last 20)",
-            f"`/chart` — Performance chart image",
-            f"`/trade` — Log an executed buy/sell with its actual fill price",
-            f"`/bulk-trade` — One `TICKER ACTION SHARES PRICE [TIME]` per line; `TICKER HOLD` is also accepted",
-            f"`/hold` — Confirm a HOLD recommendation (ticker)",
+            f"`/trades` — Durable MarketWatch execution journal",
             f"`/help` — This message",
+            f"",
+            f"**Execution:** Place all orders on MarketWatch. The bridge imports verified fills, holdings, and original timestamps automatically.",
             f"",
             f"**Admin Commands** (Admin role only):",
             f"`/pause` — Pause the engine loop",
@@ -316,6 +237,6 @@ class QueryCog(commands.Cog):
             f"`/stop` — Gracefully stop the engine (preserves cache)",
             f"`/clear` — Clear news cache, state files, and competition ledger",
             f"",
-            f"Trader role required for query/trade commands; Admin role required for engine controls.",
+            f"Trader role required for query commands; Admin role required for engine controls.",
         ]
         await interaction.response.send_message("\n".join(lines), ephemeral=False)

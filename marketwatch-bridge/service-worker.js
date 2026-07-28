@@ -3,6 +3,7 @@ const STORE_NAME = "outbox";
 const SYNC_ALARM = "glassbox-sync";
 const GAME_SLUG = "wolves-of-wall-street---july-2026";
 const MAX_RETRY_DELAY_MS = 30 * 60 * 1000;
+const HEARTBEAT_INTERVAL_MS = 60 * 1000;
 
 function openDatabase() {
   return new Promise((resolve, reject) => {
@@ -126,16 +127,76 @@ async function capture(payload, sender) {
     await setStatus({ state: "waiting", detail: "Open the signed-in Portfolio view so the bridge can read a complete holdings table." });
     return { accepted: false, state: "waiting" };
   }
+  if (!payload.snapshot?.cash_complete || !Number.isFinite(payload.snapshot?.cash_balance)) {
+    await setStatus({ state: "waiting", detail: "Waiting for the visible Cash Remaining value before syncing." });
+    return { accepted: false, state: "waiting" };
+  }
   const hash = stableSnapshotHash(payload);
-  const { lastSnapshotHash } = await chrome.storage.local.get("lastSnapshotHash");
-  if (hash === lastSnapshotHash) {
-    return { accepted: true, state: "unchanged" };
+  const now = Date.now();
+  const { lastSnapshotHash, lastSnapshotQueuedAt, bridgeStatus } = await chrome.storage.local.get([
+    "lastSnapshotHash", "lastSnapshotQueuedAt", "bridgeStatus"
+  ]);
+  if (hash === lastSnapshotHash && now - Number(lastSnapshotQueuedAt || 0) < HEARTBEAT_INTERVAL_MS) {
+    return {
+      accepted: true,
+      state: bridgeStatus?.state || "unchanged",
+      detail: bridgeStatus?.detail
+    };
   }
   await enqueue(payload);
-  await chrome.storage.local.set({ lastSnapshotHash: hash });
+  await chrome.storage.local.set({ lastSnapshotHash: hash, lastSnapshotQueuedAt: now });
   await setStatus({ state: "pending", detail: "Portfolio snapshot queued for reconciliation." });
   await flushOutbox();
-  return { accepted: true, state: "queued" };
+  const { bridgeStatus: updatedStatus } = await chrome.storage.local.get("bridgeStatus");
+  return {
+    accepted: true,
+    state: updatedStatus?.state || "pending",
+    detail: updatedStatus?.detail
+  };
+}
+
+function isWolvesTab(tab) {
+  return typeof tab?.id === "number" && tab.url?.includes(`/games/${GAME_SLUG}`);
+}
+
+async function requestCaptureFromTab(tab) {
+  try {
+    await chrome.tabs.sendMessage(tab.id, { type: "glassbox-capture-now" });
+    return true;
+  } catch (error) {
+    const detail = String(error?.message || error);
+    if (!detail.includes("Receiving end does not exist")) {
+      throw error;
+    }
+    // Reloading an unpacked extension disconnects old content scripts until the page reloads.
+    await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["parser-core.js", "content.js"] });
+    return true;
+  }
+}
+
+async function requestPortfolioCapture() {
+  const tabs = await chrome.tabs.query({ url: "https://www.marketwatch.com/games/*" });
+  const wolvesTabs = tabs.filter(isWolvesTab);
+  if (!wolvesTabs.length) {
+    await setStatus({ state: "waiting", detail: "Keep the signed-in Wolves Portfolio page open for heartbeat sync." });
+    return false;
+  }
+  const results = await Promise.allSettled(wolvesTabs.map(requestCaptureFromTab));
+  const failure = results.find((result) => result.status === "rejected");
+  if (failure) {
+    await setStatus({ state: "pending", detail: String(failure.reason?.message || failure.reason) });
+    return false;
+  }
+  return true;
+}
+
+async function runScheduledSync() {
+  try {
+    await requestPortfolioCapture();
+    await flushOutbox();
+  } catch (error) {
+    await setStatus({ state: "pending", detail: String(error?.message || error) });
+  }
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -155,8 +216,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === SYNC_ALARM) {
-    flushOutbox();
+    runScheduledSync();
   }
 });
-chrome.runtime.onInstalled.addListener(() => chrome.alarms.create(SYNC_ALARM, { periodInMinutes: 1 }));
-chrome.runtime.onStartup.addListener(() => flushOutbox());
+chrome.alarms.create(SYNC_ALARM, { periodInMinutes: 1 });
+chrome.runtime.onInstalled.addListener(() => runScheduledSync());
+chrome.runtime.onStartup.addListener(() => runScheduledSync());

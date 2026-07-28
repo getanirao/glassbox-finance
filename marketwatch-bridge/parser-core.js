@@ -41,21 +41,42 @@
     return score;
   }
 
+  function extractTickerShares(cellText) {
+    const text = clean(cellText);
+    const parts = text.split(/[\/\n\r]\s*/);
+    const first = clean(parts[0]);
+    const tickerMatch = first.match(/^([A-Z.]{1,8})(?:\s+|$)/);
+    if (tickerMatch) return { ticker: tickerMatch[1], text };
+    const multiMatch = text.match(/^([A-Z.]{1,8})\s+/);
+    if (multiMatch) return { ticker: multiMatch[1], text };
+    return null;
+  }
+
   function parsePortfolio(tables, pageText) {
     const candidates = [];
     for (const table of tables) {
       if (table.visible === false) continue;
       const tickerIndex = headerIndex(table.headers, ["ticker", "symbol"]);
       const sharesIndex = headerIndex(table.headers, ["shares", "quantity", "qty"]);
-      if (tickerIndex < 0 || sharesIndex < 0) continue;
+      if (tickerIndex < 0 && sharesIndex < 0) continue;
       const actionIndex = headerIndex(table.headers, ["action", "transaction type", "trade type", "order type"]);
       const timestampIndex = headerIndex(table.headers, ["executed", "date", "time"]);
       if (actionIndex >= 0 && timestampIndex >= 0) continue;
+      const mergedIndex = tickerIndex === sharesIndex ? tickerIndex : -1;
       const positions = [];
       for (const row of table.rows) {
-        const ticker = clean(row[tickerIndex]).toUpperCase();
-        const shares = integerFrom(row[sharesIndex]);
-        if (/^[A-Z.]{1,8}$/.test(ticker) && shares) positions.push({ ticker, shares });
+        if (mergedIndex >= 0) {
+          const extracted = extractTickerShares(row[mergedIndex]);
+          if (!extracted) continue;
+          const allText = extracted.text;
+          const sharesMatch = allText.match(/(\d+)\s*Shares/i);
+          const shares = sharesMatch ? parseInt(sharesMatch[1], 10) : null;
+          if (/^[A-Z.]{1,8}$/.test(extracted.ticker) && shares) positions.push({ ticker: extracted.ticker, shares });
+        } else {
+          const ticker = clean(row[tickerIndex]).toUpperCase();
+          const shares = integerFrom(row[sharesIndex]);
+          if (/^[A-Z.]{1,8}$/.test(ticker) && shares) positions.push({ ticker, shares });
+        }
       }
       candidates.push({ score: tableScore(table, "portfolio"), positions });
     }

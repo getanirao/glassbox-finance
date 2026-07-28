@@ -3,6 +3,7 @@ import math
 import json
 import time
 import datetime
+import concurrent.futures
 import re
 import random
 import threading
@@ -1259,7 +1260,13 @@ def process_ticker(ticker, index, total, news_cache):
                     directive = f"[MOCK ACTION] Would REJECT (CR={cr:.2f}, D/E={dte:.2f})."
             else:
                 directive = "[MOCK ACTION] Would PASS Solvency and BUY shares."
-        info = stock.info
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                fut = pool.submit(lambda: stock.info)
+                info = fut.result(timeout=30)
+        except (concurrent.futures.TimeoutError, Exception):
+            print(f"  [{index}/{total}] {ticker} TIMEOUT - yfinance info timed out.")
+            return None
         roe = info.get("returnOnEquity")
         if roe and roe > 0:
             roe_factor = max(0.5, min(1.5, roe / 0.20))

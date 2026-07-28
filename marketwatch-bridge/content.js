@@ -29,7 +29,8 @@
       const headers = headerRow
         ? [...headerRow.querySelectorAll("th, td")].map((cell) => parser.clean(cell.textContent).toLowerCase())
         : [];
-      const rows = [...table.querySelectorAll("tbody tr")]
+      const rows = [...table.rows]
+        .filter(row => row.parentElement !== table.tHead)
         .filter(isVisible)
         .map((row) => [...row.querySelectorAll("th, td")].map((cell) => parser.clean(cell.textContent)));
       return { headers, rows, context: tableContext(table), visible: isVisible(table) };

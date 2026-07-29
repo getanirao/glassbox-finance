@@ -90,6 +90,7 @@ The baseline step reads the current portfolio only; it creates no MarketWatch tr
 | `CORE_PORTFOLIO_HOLDINGS` | 6 | Core positions funded at standard conviction |
 | `MAX_PORTFOLIO_HOLDINGS` | 8 | Absolute portfolio maximum |
 | `MAX_BUYS_PER_CYCLE` | 8 | Max new BUY recommendations per cycle |
+| `MAX_POSITION_WEIGHT` | 0.40 | Max fraction of cash allocated to a single BUY |
 | `MIN_CASH_RESERVE_PERCENT` | 0.10 | Minimum cash left after planned BUY allocations |
 | `SENTIMENT_BUY_THRESHOLD` | 0.15 | Minimum current sentiment for a core BUY |
 | `PERSISTENT_SENTIMENT_THRESHOLD` | 0.35 | Minimum current and 21d sentiment for a reserve slot |

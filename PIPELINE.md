@@ -1,6 +1,11 @@
 ## Active Log
 
-### 2026-07-28 06:43 (UTC)
+### 2026-07-29 17:50 (UTC)
+- **Change:** Fixed bridge snapshot correction setting `avg_price = float(shares)` for new positions, causing phantom 100%+ gains and false `profit_take`; replaced with yfinance current price. Removed `rank_or_sentiment_exit` rule selling any holding outside the top 8 predictions regardless of sentiment. Added `upgrade_replacement` swap logic that sells lower-scored holdings to fund higher-scored candidates. Dashboard now always shows actionable SELL/BUY recs even during gate cooldown. Increased `MAX_POSITION_WEIGHT` from 0.30 to 0.40 for larger concentrated positions.
+- **Reason:** Phantom `profit_take` triggered on newly bought ROST (avg_price $71 → real cost $253). Mass-selling all non-top-8 holdings was too aggressive — should only sell on negative sentiment or specific replacement. Users need to see proposed trades even when gate is closed. 30% weight cap diluted recommended share counts below what users could afford.
+- **Files:** `engine.py`, `marketwatch_sync.py`, `config.py`, `README.md`, `PIPELINE.md`
+
+---
 - **Change:** Pinned the model-builder toolchain (`torch==2.13.0+cpu`, `onnx==1.22.0`, and `onnxscript==0.7.1`), made ModernFinBERT export the clean-build default, suppressed only the irrelevant no-PyTorch Transformers advisory at ONNX runtime, rebuilt and recreated the service, then qualified the release with a complete live 75-ticker cycle, automatic bridge recovery across receiver restarts, nine Python tests, four parser fixtures, scorer polarity checks, and final ledger/allocation/resource audits.
 - **Reason:** Competition readiness requires reproducible future images and live proof that the scanner, ONNX scorer, MarketWatch heartbeat, dashboard, durable `$100,000` baseline, explicit decision labels, and 10% cash reserve operate together without fallback, stale context, or sustained laptop load.
 - **Files:** `Dockerfile`, `README.md`, `PIPELINE.md`

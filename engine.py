@@ -1022,26 +1022,27 @@ def build_competition_dashboard(
     lines.append("")
     rec_map = {rec["ticker"]: rec for rec in recs}
     actionables = [r for r in recs if r["action"] in ("BUY", "SELL")]
-    if has_final_recs and actionables:
-        execute_by = execution_expires_at or (
-            datetime.datetime.now(datetime.timezone.utc)
-            + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)
-        )
-        if isinstance(execute_by, str):
-            execute_by = datetime.datetime.fromisoformat(execute_by)
-        ex_hhmm = execute_by.strftime("%H:%M")
+    if actionables:
         lines.append("")
-        lines.append(f"**Trade Plan — execute by {ex_hhmm} UTC**")
-        for rec in actionables:
-            lines.append(f"`{rec['action']} {rec['target_shares']} {rec['ticker']}` on MarketWatch")
-        lines.append("The MarketWatch bridge imports verified fills and original timestamps automatically.")
-        lines.append("HOLD positions require no action.")
-    elif not has_final_recs:
-        lines.append("")
-        if sync["enabled"] and not sync["healthy"]:
-            lines.append("**Preview only — final trade instructions are blocked until MarketWatch sync is healthy.**")
+        if has_final_recs:
+            execute_by = execution_expires_at or (
+                datetime.datetime.now(datetime.timezone.utc)
+                + datetime.timedelta(minutes=EXECUTION_WINDOW_MINUTES)
+            )
+            if isinstance(execute_by, str):
+                execute_by = datetime.datetime.fromisoformat(execute_by)
+            ex_hhmm = execute_by.strftime("%H:%M")
+            lines.append(f"**Trade Plan — execute by {ex_hhmm} UTC**")
         else:
-            lines.append("**Preview only — final trade instructions unlock during the next market-open gate.**")
+            if sync["enabled"] and not sync["healthy"]:
+                lines.append("**Preview only — MarketWatch sync is unhealthy.**")
+            else:
+                lines.append("**Recommended Actions (gate cooldown — will auto-execute next window):**")
+        for rec in actionables:
+            lines.append(f"`{rec['action']} {rec['target_shares']} {rec['ticker']}` {rec.get('reason', '')}")
+        if has_final_recs:
+            lines.append("The MarketWatch bridge imports verified fills and original timestamps automatically.")
+            lines.append("HOLD positions require no action.")
     else:
         lines.append("")
         lines.append("**All positions held — no trades needed this cycle**")
@@ -1476,7 +1477,6 @@ def compute_recommendations(predicted, ledger, all_predictions=None):
             if isinstance(loaded, list):
                 all_predictions = loaded
     all_prediction_map = {r["ticker"]: r for r in all_predictions if isinstance(r, dict) and "ticker" in r}
-    ranked_tickers = {r["ticker"] for r in predicted}
     cash = max(0.0, ledger["cash_balance"])
     recs = []
     sold_tickers = set()
@@ -1522,14 +1522,14 @@ def compute_recommendations(predicted, ledger, all_predictions=None):
             if gain_pct >= PROFIT_TAKE_PERCENT:
                 add_sell(ticker, max(1, pos["shares"] // 2), price, "profit_take")
 
-    # A held name outside the ranked allocation set or with negative sentiment exits.
+    # A held name with negative sentiment exits.
     for ticker, pos in ledger["holdings"].items():
         if ticker in sold_tickers:
             continue
         scored = all_prediction_map.get(ticker)
-        if scored is None or ticker not in ranked_tickers or scored.get("sentiment", 0) < SENTIMENT_EXIT_THRESHOLD:
+        if scored is None or scored.get("sentiment", 0) < SENTIMENT_EXIT_THRESHOLD:
             price = _get_price(ticker)
-            add_sell(ticker, pos["shares"], price, "rank_or_sentiment_exit", full_exit=True)
+            add_sell(ticker, pos["shares"], price, "sentiment_exit", full_exit=True)
 
     remaining_holdings = len(ledger["holdings"]) - len(full_exit_tickers)
     sector_counts, factor_counts = _exposure_counts(
@@ -1576,6 +1576,9 @@ def compute_recommendations(predicted, ledger, all_predictions=None):
         if not price or price <= 0:
             decisions[ticker] = ("DEFER", "price_unavailable")
             continue
+        if price > cash:
+            decisions[ticker] = ("DEFER", "low_cash")
+            continue
         selected = dict(candidate)
         selected["price"] = price
         selected["allocation_type"] = "core" if planned_holdings < CORE_PORTFOLIO_HOLDINGS else "satellite"
@@ -1584,12 +1587,55 @@ def compute_recommendations(predicted, ledger, all_predictions=None):
         planned_holdings += 1
         _add_exposure(ticker, sector_counts, factor_counts)
 
+    # ── Replacement pass ──
+    # If high-scored candidates were DEFER/low_cash, try to fund them by selling
+    # lower-scored holdings (upgrade swap).
+    upgrade_funds = 0.0
+    if any(d[0] == "DEFER" and d[1] == "low_cash" for d in decisions.values()):
+        held_scores = {}
+        for ht, hp in ledger["holdings"].items():
+            if ht in sold_tickers:
+                continue
+            hp_pred = all_prediction_map.get(ht, {})
+            held_scores[ht] = {
+                "score": hp_pred.get("adjusted_score", 0),
+                "shares": hp["shares"],
+                "price": _get_price(ht) or 0,
+            }
+        for candidate in predicted:
+            ticker = candidate["ticker"]
+            if decisions.get(ticker) != ("DEFER", "low_cash"):
+                continue
+            if len(buy_candidates) >= MAX_BUYS_PER_CYCLE:
+                break
+            if planned_holdings >= MAX_PORTFOLIO_HOLDINGS:
+                break
+            cand_score = candidate.get("adjusted_score", 0)
+            worst_ht = min(held_scores, key=lambda t: held_scores[t]["score"]) if held_scores else None
+            if not worst_ht or held_scores[worst_ht]["score"] >= cand_score:
+                continue
+            ws = held_scores[worst_ht]
+            proceeds = ws["shares"] * ws["price"]
+            price = _get_price(ticker)
+            if not price or proceeds < price:
+                continue
+            add_sell(worst_ht, ws["shares"], ws["price"], "upgrade_replacement", full_exit=True)
+            upgrade_funds += proceeds
+            del held_scores[worst_ht]
+            selected = dict(candidate)
+            selected["price"] = price
+            selected["allocation_type"] = "upgrade"
+            buy_candidates.append(selected)
+            decisions[ticker] = ("BUY", "upgrade_replacement")
+            planned_holdings += 1
+
     buy_weights = capped_score_weights(buy_candidates)
     for candidate in buy_candidates:
         weight = buy_weights.get(candidate["ticker"], 0.0)
         price = candidate["price"]
         if price and price > 0:
-            target_shares = int((cash * weight) / price)
+            avail = cash + (upgrade_funds if candidate.get("allocation_type") == "upgrade" else 0.0)
+            target_shares = int((avail * weight) / price)
             if target_shares > 0:
                 recs.append({
                     "ticker": candidate["ticker"],
@@ -1913,6 +1959,7 @@ class EngineRunner:
         last_viz_time = 0.0
         last_history_time = 0.0
         news_just_fetched_this_cycle = False
+        _baseline_was_complete = False
 
         while not self._stopped.is_set():
             self._heartbeat()
@@ -2010,6 +2057,46 @@ class EngineRunner:
 
                 print(f"\n  Next full cycle +{LOOP_INTERVAL_MINUTES}min.")
                 last_viz_time = now_ts
+
+            # ── Clock 2: re-evaluate when bridge baseline completes ──
+            sync_status = marketwatch_sync_status()
+            baseline_healthy = sync_status.get("healthy", False) and sync_status.get("status") == "healthy"
+            if baseline_healthy and not _baseline_was_complete:
+                _baseline_was_complete = True
+                print(f"\n  [Eval] Bridge baseline completed — running full evaluation...")
+                news_cache = load_news_cache()
+                ranked_predictions = run_full_evaluation(news_cache)
+                predicted = ranked_predictions[:MAX_PORTFOLIO_HOLDINGS]
+                if ranked_predictions:
+                    _write_json_atomic(COMPETITION_PREDICTION_FILE, ranked_predictions)
+                ledger = load_competition_ledger()
+                recs, display = compute_recommendations(predicted, ledger, ranked_predictions)
+                daily_allowed = check_daily_gate()
+                should_issue = daily_allowed and market_state == "MARKET_OPEN" and baseline_healthy
+                active_plan = None
+                dashboard_recs = recs
+                execution_expires_at = None
+                if should_issue:
+                    if any(rec.get("action") in {"BUY", "SELL"} for rec in recs):
+                        active_plan = save_execution_plan(recs)
+                        dashboard_recs = active_plan["recs"]
+                        execution_expires_at = active_plan["expires_at"]
+                    else:
+                        clear_execution_plan()
+                    mark_daily_allocation()
+                    self._update_status(last_run_utc=datetime.datetime.now(datetime.timezone.utc).isoformat())
+                    print(f"  [Gate] Daily allocation window opened — recommendations issued.")
+                else:
+                    print(f"  [Gate] Prediction updated — gate cooldown.")
+                payload = build_competition_dashboard(
+                    ledger, display, dashboard_recs, market_state, et_now,
+                    has_final_recs=should_issue,
+                    execution_expires_at=execution_expires_at,
+                )
+                send_or_update_comp_dashboard(payload)
+                last_viz_time = now_ts
+            elif not baseline_healthy:
+                _baseline_was_complete = False
 
             # ── Clock 3: 60-second visualization ──
             if now_ts - last_viz_time >= 60:
